@@ -1,16 +1,16 @@
-{$PUBLIC_DOMAIN:localhost} {
-    # Terminate TLS and HTTP/2
+# Example Caddyfile configuration for your host's global Caddy:
+# (Replace dl.yourdomain.com with your actual public domain)
+
+dl.yourdomain.com {
     encode zstd gzip
 
-    # Proxy to mtflux service with streaming (disable response buffering)
-    reverse_proxy mtflux:{$PORT:8080} {
+    # Unbuffered streaming reverse proxy to mtflux
+    reverse_proxy 127.0.0.1:8080 {
         flush_interval -1
     }
 
-    # Logging
     log {
         output stdout
         format console
     }
 }
-

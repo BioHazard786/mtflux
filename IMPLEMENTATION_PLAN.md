@@ -73,7 +73,7 @@ internal/access/          owner/admins/allowlist/bans (env seed + /data/acl.json
 internal/bot/             main-bot handlers & commands (gotd updates.Manager + tg.UpdateDispatcher, message/markup helpers)
 internal/httpapi/         net/http mux: /dl, /healthz, /metrics; RFC 7233 Range, ETag, If-Range, Content-Disposition (RFC 6266/5987)
 internal/metrics/         Prometheus collectors + snapshot for /stats
-deploy/                   Dockerfile (scratch, CGO_ENABLED=0), docker-compose.yml (+ Caddy for TLS/HTTP2), sample .env
+deploy/                   Dockerfile (scratch, CGO_ENABLED=0), docker-compose.yml, sample .env
 ```
 
 Dependencies:

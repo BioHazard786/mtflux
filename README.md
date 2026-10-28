@@ -76,11 +76,44 @@ cp .env.sample .env
 # Edit credentials in .env
 nano .env
 
-# Start with Caddy (automatic HTTPS)
+# Start container
 docker compose up -d
 ```
 
-### 3. Local Development Build
+### 3. Reverse Proxy Configuration (Caddy / Nginx)
+
+mtflux exposes its HTTP port (default `8080`) to the host. Configure your global reverse proxy:
+
+**Caddy:**
+```caddy
+dl.yourdomain.com {
+    encode zstd gzip
+
+    # Unbuffered streaming reverse proxy
+    reverse_proxy 127.0.0.1:8080 {
+        flush_interval -1
+    }
+}
+```
+
+**Nginx:**
+```nginx
+server {
+    server_name dl.yourdomain.com;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_buffering off;
+        proxy_read_timeout 300s;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+}
+```
+
+### 4. Local Development Build
 
 ```bash
 # Build mtflux and benchmark harness
