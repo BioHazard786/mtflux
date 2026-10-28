@@ -1,0 +1,16 @@
+# Binaries
+bin/
+*.exe
+*.test
+
+# Local data & sessions
+data/
+*.tmp*
+
+# Secrets & Environment
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/

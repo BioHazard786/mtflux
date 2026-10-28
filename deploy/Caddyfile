@@ -1,0 +1,15 @@
+{$PUBLIC_DOMAIN:localhost} {
+    # Terminate TLS and HTTP/2
+    encode zstd gzip
+
+    # Proxy to mtflux service with streaming (disable response buffering)
+    reverse_proxy mtflux:8080 {
+        flush_interval -1
+    }
+
+    # Logging
+    log {
+        output stdout
+        format console
+    }
+}

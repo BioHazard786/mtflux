@@ -1,0 +1,38 @@
+services:
+  mtflux:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - mtflux_data:/data
+    networks:
+      - mtflux_net
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      - PUBLIC_DOMAIN=${PUBLIC_DOMAIN:-localhost}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - mtflux
+    networks:
+      - mtflux_net
+
+volumes:
+  mtflux_data:
+  caddy_data:
+  caddy_config:
+
+networks:
+  mtflux_net:
+    driver: bridge
