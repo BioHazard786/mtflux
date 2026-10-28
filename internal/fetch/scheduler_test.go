@@ -8,9 +8,9 @@ import (
 	"time"
 
 	"github.com/gotd/td/tgerr"
-	"github.com/mtflux/mtflux/internal/metrics"
-	"github.com/mtflux/mtflux/internal/resolver"
-	gotgtg "github.com/mtflux/mtflux/internal/tg"
+	"github.com/biohazard786/mtflux/internal/metrics"
+	"github.com/biohazard786/mtflux/internal/resolver"
+	gotgtg "github.com/biohazard786/mtflux/internal/tg"
 	"go.uber.org/zap"
 )
 

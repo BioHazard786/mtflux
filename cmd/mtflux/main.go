@@ -10,15 +10,15 @@ import (
 	"time"
 
 	"github.com/gotd/td/tg"
-	"github.com/mtflux/mtflux/internal/access"
-	"github.com/mtflux/mtflux/internal/bot"
-	"github.com/mtflux/mtflux/internal/config"
-	"github.com/mtflux/mtflux/internal/fetch"
-	"github.com/mtflux/mtflux/internal/httpapi"
-	"github.com/mtflux/mtflux/internal/metrics"
-	"github.com/mtflux/mtflux/internal/resolver"
-	"github.com/mtflux/mtflux/internal/stream"
-	gotgtg "github.com/mtflux/mtflux/internal/tg"
+	"github.com/biohazard786/mtflux/internal/access"
+	"github.com/biohazard786/mtflux/internal/bot"
+	"github.com/biohazard786/mtflux/internal/config"
+	"github.com/biohazard786/mtflux/internal/fetch"
+	"github.com/biohazard786/mtflux/internal/httpapi"
+	"github.com/biohazard786/mtflux/internal/metrics"
+	"github.com/biohazard786/mtflux/internal/resolver"
+	"github.com/biohazard786/mtflux/internal/stream"
+	gotgtg "github.com/biohazard786/mtflux/internal/tg"
 	"go.uber.org/zap"
 )
 
@@ -92,7 +92,7 @@ func main() {
 		zap.String("profile", string(cfg.SpeedProfile)),
 		zap.Int("conns_per_bot_dc", cfg.ConnsPerBotPerDC),
 		zap.Int("stream_window_max", cfg.StreamWindowMax),
-		zap.String("http_addr", cfg.HTTPAddr),
+		zap.String("http_addr", cfg.HTTPAddr()),
 		zap.String("public_url", cfg.PublicURL),
 	)
 
@@ -202,14 +202,14 @@ func main() {
 	// 9. HTTP Server setup
 	server := httpapi.NewServer(cfg, accessMgr, res, sched, budget, m, logger)
 	httpServer := &http.Server{
-		Addr:              cfg.HTTPAddr,
+		Addr:              cfg.HTTPAddr(),
 		Handler:           server.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
 
 	go func() {
-		logger.Info("HTTP download and metrics server listening", zap.String("addr", cfg.HTTPAddr))
+		logger.Info("HTTP download and metrics server listening", zap.String("addr", cfg.HTTPAddr()))
 		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Fatal("HTTP server failed", zap.Error(err))
 		}

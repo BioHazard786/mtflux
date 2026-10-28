@@ -1,4 +1,4 @@
-module github.com/mtflux/mtflux
+module github.com/biohazard786/mtflux
 
 go 1.26.10
 

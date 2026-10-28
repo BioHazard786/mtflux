@@ -3,7 +3,7 @@
     encode zstd gzip
 
     # Proxy to mtflux service with streaming (disable response buffering)
-    reverse_proxy mtflux:8080 {
+    reverse_proxy mtflux:{$PORT:8080} {
         flush_interval -1
     }
 
@@ -13,3 +13,4 @@
         format console
     }
 }
+

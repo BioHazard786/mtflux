@@ -63,11 +63,22 @@ func TestConfigLoadAndProfiles(t *testing.T) {
 		t.Errorf("expected StreamWindowMax=32, got %d", cfgExtreme.StreamWindowMax)
 	}
 
-	// Test worker tokens
-	os.Setenv("WORKER_TOKENS", "456:worker1, 789:worker2")
+	// Test worker tokens with WORKER_TOKEN_1, WORKER_TOKEN_2
+	os.Setenv("WORKER_TOKEN_1", "456:worker1")
+	os.Setenv("WORKER_TOKEN_2", "789:worker2")
+	defer func() {
+		os.Unsetenv("WORKER_TOKEN_1")
+		os.Unsetenv("WORKER_TOKEN_2")
+		os.Unsetenv("PORT")
+	}()
+
+	os.Setenv("PORT", "9090")
 	cfgWorkers, err := Load("")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfgWorkers.HTTPAddr() != ":9090" {
+		t.Errorf("expected :9090, got %s", cfgWorkers.HTTPAddr())
 	}
 	allTokens := cfgWorkers.AllBotTokens()
 	if len(allTokens) != 3 {

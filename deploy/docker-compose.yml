@@ -19,6 +19,7 @@ services:
       - "443:443"
     environment:
       - PUBLIC_DOMAIN=${PUBLIC_DOMAIN:-localhost}
+      - PORT=${PORT:-8080}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
@@ -36,3 +37,4 @@ volumes:
 networks:
   mtflux_net:
     driver: bridge
+

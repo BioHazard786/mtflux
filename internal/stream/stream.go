@@ -6,8 +6,8 @@ import (
 	"io"
 	"sync"
 
-	"github.com/mtflux/mtflux/internal/fetch"
-	"github.com/mtflux/mtflux/internal/resolver"
+	"github.com/biohazard786/mtflux/internal/fetch"
+	"github.com/biohazard786/mtflux/internal/resolver"
 	"golang.org/x/sync/semaphore"
 )
 
@@ -288,3 +288,4 @@ func (r *Reader) Close() error {
 
 	return nil
 }
+

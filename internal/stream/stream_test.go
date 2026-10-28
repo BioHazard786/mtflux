@@ -11,9 +11,9 @@ import (
 	"testing"
 
 	"github.com/gotd/td/tgerr"
-	"github.com/mtflux/mtflux/internal/fetch"
-	"github.com/mtflux/mtflux/internal/resolver"
-	gotgtg "github.com/mtflux/mtflux/internal/tg"
+	"github.com/biohazard786/mtflux/internal/fetch"
+	"github.com/biohazard786/mtflux/internal/resolver"
+	gotgtg "github.com/biohazard786/mtflux/internal/tg"
 	"go.uber.org/zap"
 )
 

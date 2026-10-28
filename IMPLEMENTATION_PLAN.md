@@ -54,7 +54,7 @@ HTTP client ─GET /dl/{token}/{name}─▶ httpapi ─▶ resolver ─(FileMeta
 
 The core idea: **chunk-level striping across bots and connections**. The unit of work is one 1 MiB chunk, not one HTTP request. Each chunk goes to whichever (bot, DC connection) slot is free and healthy. On a flood wait we move the chunk to another bot right away instead of sleeping.
 
-## Package layout (greenfield; module `github.com/<you>/mtflux`)
+## Package layout (module `github.com/biohazard786/mtflux`)
 
 ```
 cmd/mtflux/main.go        wiring, graceful shutdown (SIGTERM drains streams)
@@ -73,7 +73,7 @@ internal/access/          owner/admins/allowlist/bans (env seed + /data/acl.json
 internal/bot/             main-bot handlers & commands (gotd updates.Manager + tg.UpdateDispatcher, message/markup helpers)
 internal/httpapi/         net/http mux: /dl, /healthz, /metrics; RFC 7233 Range, ETag, If-Range, Content-Disposition (RFC 6266/5987)
 internal/metrics/         Prometheus collectors + snapshot for /stats
-deploy/                   Dockerfile (distroless, CGO_ENABLED=0), docker-compose.yml (+ Caddy for TLS/HTTP2), sample .env
+deploy/                   Dockerfile (scratch, CGO_ENABLED=0), docker-compose.yml (+ Caddy for TLS/HTTP2), sample .env
 ```
 
 Dependencies:

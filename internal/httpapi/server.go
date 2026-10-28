@@ -11,13 +11,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mtflux/mtflux/internal/access"
-	"github.com/mtflux/mtflux/internal/config"
-	"github.com/mtflux/mtflux/internal/fetch"
-	"github.com/mtflux/mtflux/internal/link"
-	"github.com/mtflux/mtflux/internal/metrics"
-	"github.com/mtflux/mtflux/internal/resolver"
-	"github.com/mtflux/mtflux/internal/stream"
+	"github.com/biohazard786/mtflux/internal/access"
+	"github.com/biohazard786/mtflux/internal/config"
+	"github.com/biohazard786/mtflux/internal/fetch"
+	"github.com/biohazard786/mtflux/internal/link"
+	"github.com/biohazard786/mtflux/internal/metrics"
+	"github.com/biohazard786/mtflux/internal/resolver"
+	"github.com/biohazard786/mtflux/internal/stream"
 	"go.uber.org/zap"
 )
 
@@ -279,3 +279,4 @@ func sanitizeASCII(name string) string {
 	}
 	return sb.String()
 }
+

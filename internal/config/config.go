@@ -33,7 +33,7 @@ type Config struct {
 	PublicURL  string `env:"PUBLIC_URL" envDefault:"http://localhost:8080"`
 
 	// HTTP Server
-	HTTPAddr string `env:"HTTP_ADDR" envDefault:":8080"`
+	Port string `env:"PORT" envDefault:"8080"`
 
 	// Speed profile & tuning
 	SpeedProfile      SpeedProfile `env:"SPEED_PROFILE" envDefault:"fast"`
@@ -76,6 +76,14 @@ func Load(envFile string) (*Config, error) {
 	cfg := &Config{}
 	if err := env.Parse(cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
+	}
+
+	// Scan WORKER_TOKEN_1 through WORKER_TOKEN_48 (channels support max 50 admins: 1 owner + 1 main bot + 48 workers)
+	for i := 1; i <= 48; i++ {
+		key := fmt.Sprintf("WORKER_TOKEN_%d", i)
+		if val := strings.TrimSpace(os.Getenv(key)); val != "" {
+			cfg.WorkerTokens = append(cfg.WorkerTokens, val)
+		}
 	}
 
 	// Clean public URL: remove trailing slash
@@ -129,6 +137,18 @@ func Load(envFile string) (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// HTTPAddr returns the listen address formatted as host:port or :port.
+func (c *Config) HTTPAddr() string {
+	p := strings.TrimSpace(c.Port)
+	if p == "" {
+		p = "8080"
+	}
+	if !strings.HasPrefix(p, ":") && !strings.Contains(p, ":") {
+		return ":" + p
+	}
+	return p
 }
 
 // AllBotTokens returns all worker bot tokens, including main bot token if configured.

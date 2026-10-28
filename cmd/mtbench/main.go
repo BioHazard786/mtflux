@@ -12,9 +12,9 @@ import (
 	"time"
 
 	"github.com/gotd/td/tg"
-	"github.com/mtflux/mtflux/internal/config"
-	"github.com/mtflux/mtflux/internal/resolver"
-	gotgtg "github.com/mtflux/mtflux/internal/tg"
+	"github.com/biohazard786/mtflux/internal/config"
+	"github.com/biohazard786/mtflux/internal/resolver"
+	gotgtg "github.com/biohazard786/mtflux/internal/tg"
 	"go.uber.org/zap"
 )
 
@@ -271,3 +271,4 @@ func parseCSVInts(s string) []int {
 	}
 	return res
 }
+

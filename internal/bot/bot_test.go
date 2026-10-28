@@ -46,3 +46,4 @@ func TestExtractMsgIDFromUpdates(t *testing.T) {
 		t.Errorf("expected 2002, got %d", id)
 	}
 }
+

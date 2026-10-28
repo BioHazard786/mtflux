@@ -58,7 +58,7 @@ HTTP client ─GET /dl/{token}/{name}─▶ httpapi ─▶ resolver ─(FileMeta
 ### 1. Requirements & Telegram Setup
 1. **API ID & API Hash**: Obtain from [my.telegram.org](https://my.telegram.org).
 2. **Main Bot**: Create via [@BotFather](https://t.me/BotFather) (`/newbot`).
-3. **Worker Bots**: Create 1 to 7 additional bots via [@BotFather].
+3. **Worker Bots**: Create worker bots via [@BotFather] (up to 48 workers supported: `WORKER_TOKEN_1` through `WORKER_TOKEN_48`, utilizing the channel's 50-admin limit: 1 owner + 1 main bot + 48 workers).
 4. **Log Channel**:
    - Create a private channel.
    - Add your **main bot AND all worker bots as Channel Administrators** with full read/write/post permissions.
@@ -67,7 +67,7 @@ HTTP client ─GET /dl/{token}/{name}─▶ httpapi ─▶ resolver ─(FileMeta
 ### 2. Deployment with Docker Compose
 
 ```bash
-git clone https://github.com/mtflux/mtflux.git
+git clone https://github.com/biohazard786/mtflux.git
 cd mtflux/deploy
 
 # Copy configuration
@@ -135,3 +135,4 @@ Outputs live latency percentiles ($P_{50}, P_{90}$), throughput MB/s, and Media-
 ## License
 
 MIT
+
