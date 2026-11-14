@@ -28,11 +28,13 @@ const (
 	telegramAlign = 4096
 
 	maxWindow = 128
-	// effectiveConnsPerBotDC is how many connections a bot really gets per DC
-	// (tg.MaxPoolConns), whatever CONNS_PER_BOT_PER_DC asks for.
-	effectiveConnsPerBotDC = 2
-	maxConnsPerBotDC       = 16
-	maxLinkTTL             = 3650 * 24 * time.Hour
+	// autoWindowCap bounds the window chosen automatically. A wider one keeps
+	// more requests in flight, but on the VPS that only made each chunk
+	// slower: with 120 instead of 64, DC 5 went from 17 to 29 in flight at the
+	// same 27 MB/s, and DC 1 and DC 4 (CPU-bound) came out 10-20% lower.
+	autoWindowCap    = 64
+	maxConnsPerBotDC = 16
+	maxLinkTTL       = 3650 * 24 * time.Hour
 
 	minSecretLen = 16
 )
@@ -285,11 +287,7 @@ func (c *Config) TuneForWorkers(workers int) {
 	}
 
 	if c.windowMaxAuto {
-		// Chunks must be delivered in order, so the window holds the requests
-		// in flight plus every finished chunk still waiting behind a slower
-		// one. At 1x the slots, half of them sit idle (measured: ~18 of 40 in
-		// flight with a window of 64); 3x keeps most of them busy.
-		w := min(max(3*bots*min(c.ConnsPerBotPerDC, effectiveConnsPerBotDC), c.profileWindow), maxWindow)
+		w := min(max(bots*c.ConnsPerBotPerDC, c.profileWindow), autoWindowCap)
 		c.StreamWindowMax = w
 	}
 	if c.windowMinAuto {
