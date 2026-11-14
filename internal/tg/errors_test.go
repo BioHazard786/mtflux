@@ -155,3 +155,9 @@ func TestWorkerHealthAndEWMA(t *testing.T) {
 	}
 }
 
+func TestClassifyFloodWaitFromStringUsesWaitArgument(t *testing.T) {
+	c := Classify(errors.New("invoke pool: rpcDoRequest: rpc error code 420: FLOOD_WAIT (1)"))
+	if c.Class != ClassFloodWait || c.Wait != time.Second {
+		t.Fatalf("got class=%v wait=%v, want flood wait of 1s", c.Class, c.Wait)
+	}
+}

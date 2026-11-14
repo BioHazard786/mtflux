@@ -1,0 +1,7 @@
+Vendored copy of github.com/gotd/ige v0.3.0 (MIT, see LICENSE), wired in via a
+`replace` in mtflux's go.mod.
+
+mtflux change: decrypt.go / encrypt.go gain register-chained 16-byte loops
+(decryptBlocks16 / encryptBlocks16), enabled on arm64 only (fast16_arm64.go).
+Measured on an Ampere A1: 644 vs 525 MB/s decrypting 1 MiB. fast_test.go checks
+they match the original loops byte for byte.

@@ -7,19 +7,19 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gotd/td/tgerr"
 	"github.com/biohazard786/mtflux/internal/metrics"
 	"github.com/biohazard786/mtflux/internal/resolver"
 	gotgtg "github.com/biohazard786/mtflux/internal/tg"
+	"github.com/gotd/td/tgerr"
 	"go.uber.org/zap"
 )
 
 type mockChunkSource struct {
-	mu           sync.Mutex
-	workerCalls  map[string]int
-	floodOnce    atomic.Bool
-	fileRefOnce  atomic.Bool
-	migrateOnce  atomic.Bool
+	mu          sync.Mutex
+	workerCalls map[string]int
+	floodOnce   atomic.Bool
+	fileRefOnce atomic.Bool
+	migrateOnce atomic.Bool
 }
 
 func newMockSource() *mockChunkSource {
@@ -64,7 +64,7 @@ func TestScheduler_StripingAndErrors(t *testing.T) {
 	meta := &resolver.FileMeta{
 		DocID: 100,
 		DC:    4,
-		Size:  10485760,
+		Size:  int64(len("chunk-data-ok")),
 	}
 
 	// Fetch chunk 0: triggers FLOOD_WAIT on bot1, requeues on bot2, triggers FILE_REFERENCE_EXPIRED, then MIGRATE, then succeeds!
@@ -80,9 +80,9 @@ func TestScheduler_StripingAndErrors(t *testing.T) {
 	if w1.IsHealthy() {
 		t.Error("bot1 should be in cooldown after FLOOD_WAIT")
 	}
-	// Target DC should have been updated to 2
-	if meta.DC != 2 {
-		t.Errorf("expected DC 2 after migrate, got %d", meta.DC)
+	// The caller's FileMeta is shared and must never be mutated by retries.
+	if meta.DC != 4 {
+		t.Errorf("shared FileMeta was mutated: DC=%d", meta.DC)
 	}
 
 	// Second fetch of same chunk should hit cache without calling worker
@@ -112,7 +112,7 @@ func TestScheduler_SingleflightDedup(t *testing.T) {
 	meta := &resolver.FileMeta{
 		DocID: 200,
 		DC:    1,
-		Size:  1048576,
+		Size:  int64(len("singleflight-ok")),
 	}
 
 	// Launch 10 concurrent requests for chunk 0
@@ -167,4 +167,3 @@ func TestScheduler_EvictDoc(t *testing.T) {
 		t.Fatalf("expected 2 calls after evict doc, got %d", calls.Load())
 	}
 }
-

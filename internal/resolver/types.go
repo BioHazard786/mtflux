@@ -25,4 +25,3 @@ type FileMeta struct {
 	Date          time.Time
 	Location      tg.InputFileLocationClass
 }
-

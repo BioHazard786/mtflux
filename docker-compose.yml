@@ -1,15 +1,40 @@
 services:
   mtflux:
     build:
-      context: ..
-      dockerfile: deploy/Dockerfile
+      context: .
+      dockerfile: Dockerfile
+      target: mtflux
     restart: unless-stopped
     env_file:
       - .env
     ports:
-      - "${PORT:-8080}:${PORT:-8080}"
+      # Use BIND_ADDR=127.0.0.1 in .env when a reverse proxy runs on this host,
+      # so the app is only reachable through it.
+      - "${BIND_ADDR:-0.0.0.0}:${PORT:-8080}:${PORT:-8080}"
     volumes:
       - mtflux_data:/data
+
+    # The app drains active downloads for up to 30s on SIGTERM; Docker's default
+    # 10s grace period would SIGKILL it mid-stream.
+    stop_grace_period: 45s
+
+    # Many bots x connections x clients means many sockets.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+
+    # Hardening: static binary, state only in /data.
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
 
 volumes:
   mtflux_data:

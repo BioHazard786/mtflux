@@ -43,9 +43,23 @@ type Manager struct {
 	ipStreams        map[string]int
 
 	// Per-user rate limiting for link generation
-	userLimiters map[int64]*rate.Limiter
+	userLimiters map[int64]*userLimiter
 	limiterMu    sync.Mutex
 }
+
+type userLimiter struct {
+	lim  *rate.Limiter
+	seen time.Time
+}
+
+const (
+	// linkRateEvery/linkRateBurst allow a full Telegram album (up to 10 files)
+	// plus headroom, then one new link per second.
+	linkRateEvery    = time.Second
+	linkRateBurst    = 20
+	limiterPruneSize = 2048
+	limiterIdleTTL   = 10 * time.Minute
+)
 
 // New initializes an ACL manager and loads persisted ACL overrides.
 func New(dataDir string, ownerID int64, adminIDs, seedAllowed []int64, accessMode string, maxStreamsPerIP, maxActiveStreams int) (*Manager, error) {
@@ -66,7 +80,7 @@ func New(dataDir string, ownerID int64, adminIDs, seedAllowed []int64, accessMod
 		maxStreamsPerIP:  maxStreamsPerIP,
 		maxActiveStreams: maxActiveStreams,
 		ipStreams:        make(map[string]int),
-		userLimiters:     make(map[int64]*rate.Limiter),
+		userLimiters:     make(map[int64]*userLimiter),
 	}
 
 	for _, a := range adminIDs {
@@ -179,18 +193,28 @@ func (m *Manager) CanGenerateLink(userID int64) bool {
 	return m.IsAllowed(userID)
 }
 
-// CheckRateLimit checks and consumes token for link generation (1 req / 2s, burst 5).
+// CheckRateLimit checks and consumes a token for link generation
+// (1 link/second, burst of 20 so a whole album goes through).
 func (m *Manager) CheckRateLimit(userID int64) bool {
+	now := time.Now()
+
 	m.limiterMu.Lock()
-	limiter, exists := m.userLimiters[userID]
+	ul, exists := m.userLimiters[userID]
 	if !exists {
-		// 1 token every 2 seconds, burst of 5
-		limiter = rate.NewLimiter(rate.Every(2*time.Second), 5)
-		m.userLimiters[userID] = limiter
+		if len(m.userLimiters) >= limiterPruneSize {
+			for id, l := range m.userLimiters {
+				if now.Sub(l.seen) > limiterIdleTTL {
+					delete(m.userLimiters, id)
+				}
+			}
+		}
+		ul = &userLimiter{lim: rate.NewLimiter(rate.Every(linkRateEvery), linkRateBurst)}
+		m.userLimiters[userID] = ul
 	}
+	ul.seen = now
 	m.limiterMu.Unlock()
 
-	return limiter.Allow()
+	return ul.lim.Allow()
 }
 
 // Allow adds a user to the allowed list and unbans them if banned.
@@ -282,4 +306,3 @@ func (m *Manager) ActiveStreamsCount() int {
 	defer m.mu.RUnlock()
 	return m.activeStreams
 }
-

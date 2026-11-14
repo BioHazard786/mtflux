@@ -134,4 +134,3 @@ func (c *ByteLRU) Clear() {
 	c.items = make(map[ChunkKey]*list.Element)
 	c.usedBytes = 0
 }
-

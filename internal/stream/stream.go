@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"sync"
+	"sync/atomic"
 
 	"github.com/biohazard786/mtflux/internal/fetch"
 	"github.com/biohazard786/mtflux/internal/resolver"
@@ -56,6 +57,7 @@ type Reader struct {
 	scheduler *fetch.Scheduler
 	budget    *GlobalBudget
 
+	stripe           int
 	chunkSize        int64
 	startChunk       int
 	endChunk         int
@@ -69,6 +71,9 @@ type Reader struct {
 
 	nextLaunchChunk int
 	activeFutures   []*chunkFuture
+	// head is the chunk the reader needs next; queued fetches use their
+	// distance from it as priority.
+	head atomic.Int64
 
 	currentData   []byte
 	currentOffset int
@@ -101,7 +106,13 @@ func NewReader(
 
 	startChunk, endChunk, firstOffset, _ := ChunkBounds(rng.Start, rng.End, chunkSize)
 
+	stripe := 0
+	if scheduler != nil {
+		stripe = scheduler.NextStripe()
+	}
+
 	r := &Reader{
+		stripe:           stripe,
 		ctx:              ctx,
 		cancel:           cancel,
 		meta:             meta,
@@ -117,6 +128,8 @@ func NewReader(
 		currentWindow:    minWindow,
 		nextLaunchChunk:  startChunk,
 	}
+
+	r.head.Store(int64(startChunk))
 
 	// Prime initial window
 	r.topUpWindow()
@@ -150,7 +163,9 @@ func (r *Reader) topUpWindow() {
 		r.activeFutures = append(r.activeFutures, future)
 
 		go func(f *chunkFuture) {
-			data, err := r.scheduler.FetchChunk(r.ctx, r.meta, f.idx)
+			idx := int64(f.idx)
+			prio := func() int { return int(idx - r.head.Load()) }
+			data, err := r.scheduler.FetchChunkPrio(r.ctx, r.meta, f.idx, r.stripe, prio)
 			f.data = data
 			f.err = err
 			close(f.done)
@@ -201,7 +216,9 @@ func (r *Reader) Read(p []byte) (n int, err error) {
 func (r *Reader) advanceHeadChunkLocked() error {
 	if len(r.activeFutures) == 0 {
 		if r.nextLaunchChunk > r.endChunk {
-			return io.EOF
+			// Every chunk has been delivered but bytes are still owed: the
+			// file was shorter than advertised. Never report that as success.
+			return io.ErrUnexpectedEOF
 		}
 		r.topUpWindow()
 		if len(r.activeFutures) == 0 {
@@ -210,6 +227,7 @@ func (r *Reader) advanceHeadChunkLocked() error {
 	}
 
 	head := r.activeFutures[0]
+	r.head.Store(int64(head.idx))
 
 	// Wait for head future to finish or context cancellation
 	r.mu.Unlock()
@@ -251,8 +269,10 @@ func (r *Reader) advanceHeadChunkLocked() error {
 
 	r.chunksRead++
 
-	// Slow-start window expansion
-	if r.chunksRead%r.currentWindow == 0 && r.currentWindow < r.maxWindow {
+	// Slow-start: double the window every minWindow chunks consumed, so a short
+	// probe wastes at most a few chunks while a real download reaches full
+	// width after about 3-4 doublings instead of crawling there.
+	if r.chunksRead%r.minWindow == 0 && r.currentWindow < r.maxWindow {
 		r.currentWindow *= 2
 		if r.currentWindow > r.maxWindow {
 			r.currentWindow = r.maxWindow
@@ -263,6 +283,65 @@ func (r *Reader) advanceHeadChunkLocked() error {
 	r.topUpWindow()
 
 	return nil
+}
+
+// WaitFirst blocks until the first chunk of the stream is available (or has
+// failed), without consuming it. Callers use it to turn an upstream failure
+// into a proper HTTP status before any response header is sent.
+func (r *Reader) WaitFirst() error {
+	r.mu.Lock()
+	if len(r.activeFutures) == 0 {
+		r.mu.Unlock()
+		return nil
+	}
+	head := r.activeFutures[0]
+	r.mu.Unlock()
+
+	select {
+	case <-r.ctx.Done():
+		return r.ctx.Err()
+	case <-head.done:
+		return head.err
+	}
+}
+
+// WriteTo streams the remaining bytes to w, handing chunk slices straight to
+// the writer without an intermediate copy. It implements io.WriterTo.
+func (r *Reader) WriteTo(w io.Writer) (int64, error) {
+	var total int64
+	for {
+		r.mu.Lock()
+		if r.closed {
+			r.mu.Unlock()
+			return total, ErrStreamClosed
+		}
+		if r.remainingBytes <= 0 {
+			r.mu.Unlock()
+			return total, nil
+		}
+		if r.currentOffset >= len(r.currentData) {
+			if err := r.advanceHeadChunkLocked(); err != nil {
+				r.mu.Unlock()
+				return total, err
+			}
+		}
+		buf := r.currentData[r.currentOffset:]
+		r.currentOffset += len(buf)
+		r.remainingBytes -= int64(len(buf))
+		r.mu.Unlock()
+
+		if len(buf) == 0 {
+			continue
+		}
+		n, err := w.Write(buf)
+		total += int64(n)
+		if err != nil {
+			return total, err
+		}
+		if n < len(buf) {
+			return total, io.ErrShortWrite
+		}
+	}
 }
 
 // Close terminates in-flight fetches and releases allocated semaphore tokens.
@@ -288,4 +367,3 @@ func (r *Reader) Close() error {
 
 	return nil
 }
-

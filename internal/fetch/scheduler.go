@@ -5,20 +5,29 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/gotd/td/tg"
 	"github.com/biohazard786/mtflux/internal/metrics"
 	"github.com/biohazard786/mtflux/internal/resolver"
 	gotgtg "github.com/biohazard786/mtflux/internal/tg"
 	"go.uber.org/zap"
-	"golang.org/x/sync/singleflight"
 )
 
 var (
 	ErrAllWorkersExhausted = errors.New("all workers are in cooldown or unavailable")
 	ErrMaxRetriesExceeded  = errors.New("chunk fetch failed after maximum retry attempts")
+	ErrShortChunk          = errors.New("telegram returned an unexpected chunk length")
+)
+
+const (
+	defaultAttemptTimeout = 10 * time.Second // per getFile RPC, measured after a slot is acquired
+	defaultFetchBudget    = 90 * time.Second // whole chunk, including time queued for a slot
+	maxFailedAttempts     = 6
+	retryTick             = 100 * time.Millisecond
+	prewarmCooldown       = 3 * time.Second
 )
 
 // ChunkSource defines an interface for fetching raw chunk bytes.
@@ -26,49 +35,75 @@ type ChunkSource interface {
 	FetchFromWorker(ctx context.Context, worker *gotgtg.Worker, meta *resolver.FileMeta, chunkIdx int, offset, limit int64) ([]byte, error)
 }
 
-// TelegramChunkSource implements ChunkSource by issuing upload.getFile RPCs via gotd.
-type TelegramChunkSource struct{}
+type slotKey struct {
+	worker int
+	dc     int
+}
 
-func (s *TelegramChunkSource) FetchFromWorker(ctx context.Context, worker *gotgtg.Worker, meta *resolver.FileMeta, chunkIdx int, offset, limit int64) ([]byte, error) {
-	pool, err := worker.GetPool(ctx, meta.DC)
-	if err != nil {
-		return nil, err
-	}
+// waiter is a chunk request queued for a (worker, DC) slot.
+type waiter struct {
+	dc     int
+	stripe int
+	prio   Priority
+	ch     chan *gotgtg.Worker // buffered(1); granted under Scheduler.mu
+}
 
-	client := tg.NewClient(pool.Invoker)
-	req := &tg.UploadGetFileRequest{
-		Location: meta.Location,
-		Offset:   offset,
-		Limit:    int(limit),
-	}
+// Priority reports how urgent a queued chunk is: 0 is the chunk a reader is
+// blocked on right now, larger is deeper read-ahead. It is evaluated at
+// dispatch time, so a prefetched chunk becomes urgent as its reader catches up.
+type Priority func() int
 
-	res, err := client.UploadGetFile(ctx, req)
-	if err != nil {
-		return nil, err
+func (p Priority) value() int {
+	if p == nil {
+		return 0
 	}
+	if v := p(); v > 0 {
+		return v
+	}
+	return 0
+}
 
-	switch f := res.(type) {
-	case *tg.UploadFile:
-		return f.Bytes, nil
-	default:
-		return nil, fmt.Errorf("unexpected file response type: %T", res)
-	}
+// call is one in-flight chunk download shared by every stream that wants it.
+type call struct {
+	prio   Priority
+	done   chan struct{}
+	data   []byte
+	err    error
+	refs   int // guarded by Scheduler.callsMu
+	cancel context.CancelFunc
 }
 
 // Scheduler coordinates chunk striping, slot management, retries, and shared caching.
 type Scheduler struct {
-	workers    []*gotgtg.Worker
-	chunkSize  int64
-	maxBots    int // 0 = all bots
-	source     ChunkSource
-	resolver   *resolver.Resolver
-	cache      *ByteLRU
-	metrics    *metrics.Metrics
-	log        *zap.Logger
+	workers   []*gotgtg.Worker
+	index     map[*gotgtg.Worker]int
+	chunkSize int64
+	maxBots   int // per-stream cap on distinct bots; 0 = all
+	resolver  *resolver.Resolver
+	cache     *ByteLRU
+	metrics   *metrics.Metrics
+	log       *zap.Logger
 
-	sf singleflight.Group
-	mu sync.Mutex
-	cond *sync.Cond
+	source         ChunkSource
+	attemptTimeout time.Duration
+	fetchBudget    time.Duration
+
+	// slot accounting + FIFO wait queue
+	mu         sync.Mutex
+	used       map[slotKey]int
+	inflight   int
+	cc         *congestion
+	waiters    []*waiter
+	retryArmed bool
+
+	// in-flight chunk dedup
+	callsMu sync.Mutex
+	calls   map[ChunkKey]*call
+
+	stripeSeq atomic.Uint64
+
+	warmMu   sync.Mutex
+	warmedAt map[int64]time.Time
 }
 
 // NewScheduler creates a chunk fetch Scheduler.
@@ -88,23 +123,57 @@ func NewScheduler(
 		log = zap.NewNop()
 	}
 
-	s := &Scheduler{
-		workers:   workers,
-		chunkSize: chunkSize,
-		maxBots:   maxBots,
-		source:    &TelegramChunkSource{},
-		resolver:  res,
-		cache:     NewByteLRU(cacheBytes),
-		metrics:   m,
-		log:       log,
+	index := make(map[*gotgtg.Worker]int, len(workers))
+	for i, w := range workers {
+		index[w] = i
 	}
-	s.cond = sync.NewCond(&s.mu)
-	return s
+
+	totalSlots := 0
+	for _, w := range workers {
+		totalSlots += w.SlotLimit(0)
+	}
+
+	return &Scheduler{
+		cc:             newCongestion(totalSlots),
+		workers:        workers,
+		index:          index,
+		chunkSize:      chunkSize,
+		maxBots:        maxBots,
+		source:         &TelegramChunkSource{},
+		resolver:       res,
+		cache:          NewByteLRU(cacheBytes),
+		metrics:        m,
+		log:            log,
+		attemptTimeout: defaultAttemptTimeout,
+		fetchBudget:    defaultFetchBudget,
+		used:           make(map[slotKey]int),
+		calls:          make(map[ChunkKey]*call),
+		warmedAt:       make(map[int64]time.Time),
+	}
 }
 
 // SetSource overrides the underlying ChunkSource (primarily used for unit testing).
 func (s *Scheduler) SetSource(source ChunkSource) {
 	s.source = source
+}
+
+// SetTimeouts overrides the per-attempt and per-chunk time budgets.
+func (s *Scheduler) SetTimeouts(attempt, budget time.Duration) {
+	if attempt > 0 {
+		s.attemptTimeout = attempt
+	}
+	if budget > 0 {
+		s.fetchBudget = budget
+	}
+}
+
+// Workers returns the worker list (read-only).
+func (s *Scheduler) Workers() []*gotgtg.Worker { return s.workers }
+
+// NextStripe returns a rotating seed that a stream uses to pick its subset of
+// bots when STREAM_MAX_BOTS is below the total, so load spreads across all bots.
+func (s *Scheduler) NextStripe() int {
+	return int(s.stripeSeq.Add(1))
 }
 
 // EvictDoc removes all cached chunks for a document (used on link revocation).
@@ -115,201 +184,559 @@ func (s *Scheduler) EvictDoc(docID int64) {
 	}
 }
 
-// FetchChunk retrieves the specified chunk, utilizing the shared LRU cache and singleflight dedup.
+// ExpectedChunkLen returns how many bytes chunk idx of a file of the given size must contain.
+// It returns -1 if the size is unknown.
+func ExpectedChunkLen(size, chunkSize int64, idx int) int64 {
+	if size <= 0 {
+		return -1
+	}
+	rem := size - int64(idx)*chunkSize
+	if rem <= 0 {
+		return 0
+	}
+	if rem < chunkSize {
+		return rem
+	}
+	return chunkSize
+}
+
+// FetchChunk retrieves the specified chunk, utilizing the shared LRU cache and in-flight dedup.
 func (s *Scheduler) FetchChunk(ctx context.Context, meta *resolver.FileMeta, chunkIdx int) ([]byte, error) {
+	return s.FetchChunkStripe(ctx, meta, chunkIdx, 0)
+}
+
+// FetchChunkStripe is FetchChunk for a stream that was assigned the given stripe seed.
+func (s *Scheduler) FetchChunkStripe(ctx context.Context, meta *resolver.FileMeta, chunkIdx, stripe int) ([]byte, error) {
+	return s.FetchChunkPrio(ctx, meta, chunkIdx, stripe, nil)
+}
+
+// FetchChunkPrio fetches a chunk for a stream with the given stripe seed and
+// urgency (see Priority). Under congestion, every stream's next-needed chunk
+// is served before anyone's deep read-ahead, so a new viewer doesn't queue
+// behind an existing viewer's whole prefetch window.
+// The download runs detached from any one caller, but is cancelled once every
+// caller waiting on it has gone away.
+func (s *Scheduler) FetchChunkPrio(ctx context.Context, meta *resolver.FileMeta, chunkIdx, stripe int, prio Priority) ([]byte, error) {
 	key := ChunkKey{DocID: meta.DocID, ChunkIdx: chunkIdx}
 
-	// 1. Check LRU Cache
 	if data, ok := s.cache.Get(key); ok {
 		if s.metrics != nil {
 			s.metrics.RecordCacheHit()
 		}
 		return data, nil
 	}
-	if s.metrics != nil {
-		s.metrics.RecordCacheMiss()
-	}
 
-	// 2. Singleflight fetch across concurrent streams
-	sfKey := fmt.Sprintf("%d:%d", meta.DocID, chunkIdx)
-	val, err, _ := s.sf.Do(sfKey, func() (interface{}, error) {
-		// Double check cache
+	s.callsMu.Lock()
+	c, joined := s.calls[key]
+	if joined {
+		c.refs++
+	} else {
+		// Re-check under the lock: the previous owner may have just stored it.
 		if data, ok := s.cache.Get(key); ok {
+			s.callsMu.Unlock()
+			if s.metrics != nil {
+				s.metrics.RecordCacheHit()
+			}
 			return data, nil
 		}
+		cctx, cancel := context.WithTimeout(context.Background(), s.fetchBudget)
+		c = &call{done: make(chan struct{}), refs: 1, cancel: cancel, prio: prio}
+		s.calls[key] = c
+		m := *meta // private copy: retries may rewrite DC / file reference
+		go s.runCall(cctx, key, c, &m, chunkIdx, stripe)
+	}
+	s.callsMu.Unlock()
 
-		// Detached context with 30s timeout to protect against single-client cancel
-		fetchCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-
-		data, err := s.fetchWithRetries(fetchCtx, meta, chunkIdx)
-		if err != nil {
-			return nil, err
+	if s.metrics != nil {
+		if joined {
+			s.metrics.RecordCacheHit() // served by another stream's in-flight fetch
+		} else {
+			s.metrics.RecordCacheMiss()
 		}
+	}
 
+	select {
+	case <-c.done:
+		return c.data, c.err
+	case <-ctx.Done():
+		s.callsMu.Lock()
+		c.refs--
+		if c.refs == 0 {
+			select {
+			case <-c.done:
+			default:
+				c.cancel() // nobody wants this chunk any more
+				if s.calls[key] == c {
+					delete(s.calls, key)
+				}
+			}
+		}
+		s.callsMu.Unlock()
+		return nil, ctx.Err()
+	}
+}
+
+func (s *Scheduler) runCall(ctx context.Context, key ChunkKey, c *call, meta *resolver.FileMeta, chunkIdx, stripe int) {
+	defer c.cancel()
+
+	data, err := s.fetchWithRetries(ctx, meta, chunkIdx, stripe, c.prio)
+	if err == nil {
 		s.cache.Put(key, data)
 		if s.metrics != nil {
 			s.metrics.CacheBytes.Set(float64(s.cache.UsedBytes()))
 		}
-		return data, nil
-	})
-
-	if err != nil {
-		return nil, err
 	}
-	return val.([]byte), nil
+	c.data, c.err = data, err
+
+	s.callsMu.Lock()
+	if s.calls[key] == c {
+		delete(s.calls, key)
+	}
+	s.callsMu.Unlock()
+	close(c.done)
 }
 
-func (s *Scheduler) fetchWithRetries(ctx context.Context, meta *resolver.FileMeta, chunkIdx int) ([]byte, error) {
-	const maxRetries = 5
+func (s *Scheduler) fetchWithRetries(ctx context.Context, meta *resolver.FileMeta, chunkIdx, stripe int, prio Priority) ([]byte, error) {
 	offset := int64(chunkIdx) * s.chunkSize
 	limit := s.chunkSize
+	expected := ExpectedChunkLen(meta.Size, s.chunkSize, chunkIdx)
 
 	var lastErr error
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
+	failures := 0
+	floods := 0
+	maxFloods := 2*len(s.workers) + 2
+
+	for failures < maxFailedAttempts {
+		if err := ctx.Err(); err != nil {
+			return nil, joinErr(lastErr, err)
 		}
 
-		worker, err := s.acquireWorkerSlot(ctx)
+		dc := meta.DC
+		worker, err := s.acquire(ctx, dc, stripe, prio)
 		if err != nil {
-			lastErr = err
-			time.Sleep(50 * time.Millisecond)
-			continue
+			return nil, joinErr(lastErr, err)
 		}
 
+		s.mu.Lock()
+		timeout := s.cc.AttemptTimeout(s.attemptTimeout)
+		deliveredAtStart := s.cc.Delivered()
+		s.mu.Unlock()
+
+		attemptCtx, cancel := context.WithTimeout(ctx, timeout)
 		start := time.Now()
-		data, err := s.source.FetchFromWorker(ctx, worker, meta, chunkIdx, offset, limit)
+		data, err := s.source.FetchFromWorker(attemptCtx, worker, meta, chunkIdx, offset, limit)
+		attemptTimedOut := err != nil && attemptCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil
+		cancel()
 		elapsed := time.Since(start)
-		s.releaseWorkerSlot(worker)
+
+		if err == nil && expected >= 0 && int64(len(data)) != expected {
+			err = fmt.Errorf("%w: chunk %d has %d bytes, want %d", ErrShortChunk, chunkIdx, len(data), expected)
+		}
+
+		s.mu.Lock()
+		switch {
+		case err == nil:
+			s.cc.OnSuccess(elapsed, deliveredAtStart)
+		case attemptTimedOut:
+			s.cc.OnTimeout()
+		}
+		if s.metrics != nil {
+			s.metrics.FetchConcurrencyLimit.Set(math.Floor(s.cc.limit))
+		}
+		s.mu.Unlock()
+		s.release(worker, dc)
 
 		if err == nil {
 			worker.RecordChunk(elapsed, len(data))
 			if s.metrics != nil {
-				s.metrics.ChunkFetchDuration.WithLabelValues(worker.ID(), fmt.Sprintf("%d", meta.DC)).Observe(elapsed.Seconds())
+				s.metrics.ChunkFetchDuration.WithLabelValues(worker.ID(), strconv.Itoa(dc)).Observe(elapsed.Seconds())
 			}
 			return data, nil
 		}
 
-		lastErr = err
-		classified := gotgtg.Classify(err)
-		if s.metrics != nil {
-			s.metrics.ChunkErrorsTotal.WithLabelValues(classified.Class.String()).Inc()
+		if ctx.Err() != nil {
+			return nil, joinErr(lastErr, ctx.Err())
 		}
 
+		lastErr = err
+		class, wait, migrateDC := classify(err)
+		if s.metrics != nil {
+			s.metrics.ChunkErrorsTotal.WithLabelValues(class.String()).Inc()
+		}
 		s.log.Warn("chunk fetch error",
 			zap.Int64("doc_id", meta.DocID),
 			zap.Int("chunk", chunkIdx),
-			zap.Int("attempt", attempt+1),
+			zap.Int("failures", failures),
 			zap.String("worker", worker.ID()),
-			zap.String("class", classified.Class.String()),
+			zap.String("class", class.String()),
 			zap.Error(err),
 		)
 
-		switch classified.Class {
+		switch class {
 		case gotgtg.ClassFloodWait:
-			worker.SetCooldown(classified.Wait)
+			worker.SetCooldown(wait)
 			if s.metrics != nil {
-				s.metrics.FloodWaitSecondsTotal.WithLabelValues(worker.ID()).Add(classified.Wait.Seconds())
+				s.metrics.FloodWaitSecondsTotal.WithLabelValues(worker.ID()).Add(wait.Seconds())
 			}
-			// Requeue immediately on another worker
+			// Another worker takes the chunk immediately; a flood wait on one
+			// bot is not a failure of the chunk itself.
+			floods++
+			if floods <= maxFloods {
+				continue
+			}
 
 		case gotgtg.ClassFileRefExpired:
-			if s.resolver != nil {
-				refreshed, refErr := s.resolver.Refresh(ctx, meta.MsgID)
-				if refErr == nil {
-					meta = refreshed
+			if inv, ok := s.source.(LocationInvalidator); ok {
+				// The reference is this bot's own; only it needs a fresh one.
+				inv.InvalidateLocation(worker, meta)
+			} else if s.resolver != nil {
+				if refreshed, refErr := s.resolver.RefreshIfStale(ctx, meta.MsgID, meta.FileReference); refErr == nil {
+					cp := *refreshed
+					cp.DC = meta.DC
+					meta = &cp
+				} else {
+					lastErr = refErr
 				}
 			}
 
 		case gotgtg.ClassMigrate:
-			meta.DC = classified.MigrateDC
+			if migrateDC > 0 {
+				meta.DC = migrateDC
+				if s.resolver != nil {
+					s.resolver.SetDC(meta.MsgID, migrateDC)
+				}
+			}
 
 		case gotgtg.ClassAuthBroken:
-			worker.InvalidatePool(meta.DC)
+			worker.InvalidatePool(dc)
+			worker.RecordFailure()
 
-		case gotgtg.ClassTransient:
-			worker.RecordChunk(elapsed, 0) // penalize EWMA
-
-		case gotgtg.ClassNoAccess, gotgtg.ClassNotFound:
+		case gotgtg.ClassNotFound:
 			return nil, err
+
+		default: // transient, no-access-for-this-bot, unknown
+			// A wrong length says something about the file, and our own
+			// attempt deadline firing usually means the link is congested;
+			// neither is the bot's fault, so don't push it into cooldown.
+			if !errors.Is(err, ErrShortChunk) && !attemptTimedOut {
+				worker.RecordFailure()
+			}
+		}
+
+		failures++
+		if backoff := time.Duration(failures) * 20 * time.Millisecond; backoff > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, joinErr(lastErr, ctx.Err())
+			case <-time.After(backoff):
+			}
 		}
 	}
 
 	return nil, fmt.Errorf("%w: %v", ErrMaxRetriesExceeded, lastErr)
 }
 
-func (s *Scheduler) acquireWorkerSlot(ctx context.Context) (*gotgtg.Worker, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
-		}
-
-		candidate := s.pickBestWorkerLocked()
-		if candidate != nil {
-			candidate.IncInflight()
-			return candidate, nil
-		}
-
-		// If no worker is currently available, wait for a signal or timeout
-		// Create a timer to wake up if in cooldown
-		ch := make(chan struct{})
-		go func() {
-			time.Sleep(100 * time.Millisecond)
-			s.mu.Lock()
-			s.cond.Broadcast()
-			s.mu.Unlock()
-			close(ch)
-		}()
-
-		s.cond.Wait()
+func classify(err error) (class gotgtg.ErrorClass, wait time.Duration, migrateDC int) {
+	if errors.Is(err, ErrShortChunk) {
+		return gotgtg.ClassTransient, 0, 0
 	}
+	if errors.Is(err, resolver.ErrNotFound) {
+		return gotgtg.ClassNotFound, 0, 0
+	}
+	c := gotgtg.Classify(err)
+	return c.Class, c.Wait, c.MigrateDC
 }
 
-func (s *Scheduler) releaseWorkerSlot(w *gotgtg.Worker) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	w.DecInflight()
-	s.cond.Signal()
+func joinErr(last, err error) error {
+	if last == nil {
+		return err
+	}
+	return fmt.Errorf("%w (last error: %v)", err, last)
 }
 
-// pickBestWorkerLocked finds the eligible worker with the lowest inflight ratio, breaking ties with EWMA latency.
-func (s *Scheduler) pickBestWorkerLocked() *gotgtg.Worker {
-	var best *gotgtg.Worker
-	bestScore := math.MaxFloat64
-	bestEWMA := math.MaxFloat64
-
-	workers := s.workers
-	if s.maxBots > 0 && s.maxBots < len(workers) {
-		workers = workers[:s.maxBots]
+// Prewarm prepares every healthy worker for a file in the background: opens
+// its pool to the file's DC and resolves its own file location, so the first
+// bytes don't wait on handshakes and the whole fleet is ready to stripe.
+func (s *Scheduler) Prewarm(meta *resolver.FileMeta) {
+	warmer, ok := s.source.(Warmer)
+	if !ok {
+		return
 	}
 
-	for _, w := range workers {
+	s.warmMu.Lock()
+	if t, ok := s.warmedAt[meta.DocID]; ok && time.Since(t) < prewarmCooldown {
+		s.warmMu.Unlock()
+		return
+	}
+	if len(s.warmedAt) > 4096 {
+		s.warmedAt = make(map[int64]time.Time)
+	}
+	s.warmedAt[meta.DocID] = time.Now()
+	s.warmMu.Unlock()
+
+	m := *meta
+	for _, w := range s.workers {
 		if !w.IsHealthy() {
 			continue
 		}
+		go func(w *gotgtg.Worker) {
+			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
+			if err := warmer.Warm(ctx, w, &m); err != nil {
+				s.log.Debug("prewarm failed", zap.String("worker", w.ID()), zap.Int("dc", m.DC), zap.Error(err))
+			}
+		}(w)
+	}
+}
 
-		status, inflight, ewma, _, _ := w.Snapshot()
-		if status != "ok" {
-			continue
-		}
+// ---- slot accounting -------------------------------------------------------
 
-		// Score: inflight load
-		score := float64(inflight)
-		if score < bestScore || (score == bestScore && ewma < bestEWMA) {
-			bestScore = score
-			bestEWMA = ewma
-			best = w
+// acquire blocks until a (worker, dc) slot is free and returns the chosen worker.
+// Queued chunks are served most-urgent first, FIFO among equals.
+func (s *Scheduler) acquire(ctx context.Context, dc, stripe int, prio Priority) (*gotgtg.Worker, error) {
+	s.mu.Lock()
+	if len(s.waiters) == 0 {
+		v := s.newViewLocked()
+		if w := s.pickLocked(v, v.dc(s, dc), stripe); w != nil {
+			s.takeLocked(w, dc)
+			s.mu.Unlock()
+			return w, nil
 		}
 	}
 
-	return best
+	wt := &waiter{dc: dc, stripe: stripe, prio: prio, ch: make(chan *gotgtg.Worker, 1)}
+	s.waiters = append(s.waiters, wt)
+	s.dispatchLocked()
+	s.mu.Unlock()
+
+	select {
+	case w := <-wt.ch:
+		return w, nil
+	case <-ctx.Done():
+		s.mu.Lock()
+		removed := s.removeWaiterLocked(wt)
+		s.mu.Unlock()
+		if !removed {
+			// Granted at the same moment we gave up: hand the slot back.
+			s.release(<-wt.ch, dc)
+		}
+		return nil, ctx.Err()
+	}
 }
 
+func (s *Scheduler) release(w *gotgtg.Worker, dc int) {
+	s.mu.Lock()
+	key := slotKey{worker: s.index[w], dc: dc}
+	if s.used[key] > 0 {
+		s.used[key]--
+		s.inflight--
+	}
+	w.DecInflight()
+	s.publishInflightLocked(w)
+	s.dispatchLocked()
+	s.mu.Unlock()
+}
+
+func (s *Scheduler) takeLocked(w *gotgtg.Worker, dc int) {
+	s.used[slotKey{worker: s.index[w], dc: dc}]++
+	s.inflight++
+	w.IncInflight()
+	s.publishInflightLocked(w)
+}
+
+func (s *Scheduler) publishInflightLocked(w *gotgtg.Worker) {
+	if s.metrics != nil {
+		s.metrics.InflightChunks.WithLabelValues(w.ID()).Set(float64(w.Inflight()))
+	}
+}
+
+func (s *Scheduler) removeWaiterLocked(wt *waiter) bool {
+	for i, x := range s.waiters {
+		if x == wt {
+			s.waiters = append(s.waiters[:i], s.waiters[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+// view is a snapshot of worker state taken once per dispatch pass, so that
+// serving thousands of queued chunks reads each worker's locks once rather
+// than once per queued chunk.
+type view struct {
+	healthy []bool
+	lat     []float64
+	dcs     map[int]*dcView
+}
+
+type dcView struct {
+	id    int
+	warm  []bool
+	limit []int
+	// gate caches whether *any* chunk for this DC can be granted right now
+	// (0 = unknown, 1 = yes, -1 = no). Once closed, every other queued chunk
+	// for the DC is skipped in O(1).
+	gate int8
+	// noSlot remembers stripe offsets that already failed this pass.
+	noSlot map[int]bool
+}
+
+func (s *Scheduler) newViewLocked() *view {
+	n := len(s.workers)
+	v := &view{healthy: make([]bool, n), lat: make([]float64, n), dcs: make(map[int]*dcView, 2)}
+	for i, w := range s.workers {
+		v.healthy[i], v.lat[i] = w.SchedState()
+	}
+	return v
+}
+
+func (v *view) dc(s *Scheduler, dc int) *dcView {
+	if dv, ok := v.dcs[dc]; ok {
+		return dv
+	}
+	n := len(s.workers)
+	dv := &dcView{id: dc, warm: make([]bool, n), limit: make([]int, n)}
+	for i, w := range s.workers {
+		if v.healthy[i] {
+			dv.warm[i] = w.PoolReady(dc)
+			dv.limit[i] = w.SlotLimit(dc)
+		}
+	}
+	v.dcs[dc] = dv
+	return dv
+}
+
+func (s *Scheduler) stripeKey(stripe int) int {
+	n := len(s.workers)
+	if s.maxBots <= 0 || s.maxBots >= n || n == 0 {
+		return 0 // stripes don't restrict anything
+	}
+	return ((stripe % n) + n) % n
+}
+
+// dispatchLocked grants free slots to queued waiters, most urgent first and
+// FIFO among equals, and arms a retry tick so waiters notice cooldown expiry
+// or newly warmed pools. Each grant is one scan of the queue; DCs (and
+// stripes) without a grantable slot are skipped in O(1).
+func (s *Scheduler) dispatchLocked() {
+	if len(s.waiters) > 0 {
+		v := s.newViewLocked()
+		for {
+			best, bestPrio := -1, 0
+			for i, wt := range s.waiters {
+				dv := v.dc(s, wt.dc)
+				if dv.gate == 0 {
+					dv.gate = -1
+					if s.pickLocked(v, dv, -1) != nil {
+						dv.gate = 1
+					}
+				}
+				if dv.gate < 0 || dv.noSlot[s.stripeKey(wt.stripe)] {
+					continue
+				}
+				if p := wt.prio.value(); best < 0 || p < bestPrio {
+					best, bestPrio = i, p
+					if p == 0 {
+						break // can't beat the oldest blocked reader
+					}
+				}
+			}
+			if best < 0 {
+				break
+			}
+
+			wt := s.waiters[best]
+			dv := v.dc(s, wt.dc)
+			w := s.pickLocked(v, dv, wt.stripe)
+			if w == nil {
+				if dv.noSlot == nil {
+					dv.noSlot = make(map[int]bool)
+				}
+				dv.noSlot[s.stripeKey(wt.stripe)] = true
+				continue
+			}
+			s.takeLocked(w, wt.dc)
+			wt.ch <- w
+			copy(s.waiters[best:], s.waiters[best+1:])
+			s.waiters[len(s.waiters)-1] = nil
+			s.waiters = s.waiters[:len(s.waiters)-1]
+			dv.gate = 0 // capacity shrank; re-check lazily
+		}
+	}
+
+	if len(s.waiters) > 0 && !s.retryArmed {
+		s.retryArmed = true
+		time.AfterFunc(retryTick, func() {
+			s.mu.Lock()
+			s.retryArmed = false
+			s.dispatchLocked()
+			s.mu.Unlock()
+		})
+	}
+}
+
+// allowed reports whether worker idx may serve a stream with the given stripe
+// (stripe < 0 means unrestricted).
+func (s *Scheduler) allowed(idx, stripe int) bool {
+	n := len(s.workers)
+	if stripe < 0 || s.maxBots <= 0 || s.maxBots >= n {
+		return true
+	}
+	return ((idx-stripe)%n+n)%n < s.maxBots
+}
+
+// pickLocked chooses the best worker with a free slot for dc: warm pools first
+// (no handshake), then lowest slot utilisation, then lowest latency. If every
+// warm worker is saturated it returns nil so the chunk waits for a warm slot
+// instead of paying for a cold handshake; if nothing is warm yet it picks the
+// best cold worker so the very first request can make progress.
+func (s *Scheduler) pickLocked(v *view, dv *dcView, stripe int) *gotgtg.Worker {
+	if !s.cc.Allow(s.inflight) {
+		return nil // the link is full; more in flight would only queue
+	}
+	var (
+		bestWarm, bestCold = -1, -1
+		warmUtil, coldUtil float64
+		anyWarm            bool
+	)
+
+	// Start scanning at the stream's own offset so that ties between equally
+	// loaded bots resolve differently per stream and spread across the fleet.
+	n := len(s.workers)
+	start := 0
+	if n > 0 && stripe > 0 {
+		start = stripe % n
+	}
+	for k := 0; k < n; k++ {
+		i := (start + k) % n
+		if !v.healthy[i] || !s.allowed(i, stripe) {
+			continue
+		}
+		if dv.warm[i] {
+			anyWarm = true
+		}
+		limit := dv.limit[i]
+		used := s.used[slotKey{worker: i, dc: dv.id}]
+		if used >= limit {
+			continue
+		}
+		util := float64(used) / float64(limit)
+
+		if dv.warm[i] {
+			if bestWarm < 0 || util < warmUtil || (util == warmUtil && v.lat[i] < v.lat[bestWarm]) {
+				bestWarm, warmUtil = i, util
+			}
+		} else if bestCold < 0 || util < coldUtil || (util == coldUtil && v.lat[i] < v.lat[bestCold]) {
+			bestCold, coldUtil = i, util
+		}
+	}
+
+	switch {
+	case bestWarm >= 0:
+		return s.workers[bestWarm]
+	case !anyWarm && bestCold >= 0:
+		return s.workers[bestCold]
+	default:
+		return nil
+	}
+}

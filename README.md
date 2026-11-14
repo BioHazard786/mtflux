@@ -1,22 +1,68 @@
 # mtflux ⚡
 
-**mtflux** is a high-throughput Telegram-to-direct-link streaming and download server written in Go. It stripes 1 MiB chunks across **$N$ worker bots $\times$ $M$ Media-DC connections** with a sliding-window reader to achieve extreme download speeds.
+**mtflux** is a high-throughput Telegram → direct-link streaming and download server written in Go. It stripes 1 MiB chunks across **N worker bots × M media-DC connections** with a sliding-window reader, so a single download link is served by many connections at once.
 
 ---
 
-## Why mtflux?
+## Why it's fast
 
-Existing solutions like TG-FileStreamBot top out around ~10 MB/s per bot because they assign one bot per HTTP request, serialize downloads across a single DC connection, lack prefetch windows, and use un-resilient batch barriers.
+Existing solutions like TG-FileStreamBot top out around ~10 MB/s per bot: one bot per request, one connection per foreign DC, batch-barrier prefetch, no sharing.
 
-mtflux changes the architecture:
-- **Chunk-level striping**: Each 1 MiB chunk is independently dispatched to the least-loaded healthy (bot, DC) connection slot.
-- **Media-only DCs**: Download sessions run against parallel-safe Media DCs, avoiding Telegram's `AUTH_KEY_DUPLICATED` triggers.
-- **Ordered sliding window with slow-start**: Reader window dynamically scales ($4 \to 16 \to 32$) without batch barriers. Probe requests (like MP4 `moov` atom seek) fetch only what is needed.
-- **Zero-downtime flood handling**: Chunks experiencing `FLOOD_WAIT` are immediately reassigned to another bot.
-- **Shared chunk cache**: Byte-budget LRU cache (`CHUNK_CACHE_MB`) deduplicates concurrent viewers, player seeks, and multi-connection downloaders (`aria2c`, IDM) using singleflight.
-- **Compact cryptographically-signed URLs**: Tamper-proof HMAC-SHA256 tokens carrying message ID, owner ID, and expiry timestamp in ~32 URL-safe characters.
-- **Full RFC 7233 compliance**: Range headers, strong ETags, 206 Partial Content, 416 Range Not Satisfiable, and RFC 6266/5987 UTF-8 `Content-Disposition`.
-- **Pure log-channel architecture**: The log channel serves as the database; no external database required.
+- **Chunk-level striping.** Each 1 MiB chunk goes to whichever (bot, DC connection) slot is free. Slots are accounted per (bot, DC): never more than M getFile RPCs in flight per bot, FIFO queue when full.
+- **Media-only DCs where they exist.** Telegram's live config advertises media-only addresses for DC 2 and DC 4 only; there each bot gets M parallel-safe connections. Every other DC (and a bot's home DC) gets a regular pool capped at 2 connections per bot, to stay clear of `AUTH_KEY_DUPLICATED`. Foreign DC requests go straight to the file's DC (no `FILE_MIGRATE` round trip).
+- **Warm pools.** Pools are opened on every bot as soon as a download starts; the scheduler prefers warm pools, so no chunk waits for a handshake once any bot is ready.
+- **Sliding window with fast slow-start.** No batch barrier. The window doubles every `STREAM_WINDOW_MIN` chunks up to `STREAM_WINDOW_MAX`, and by default scales to *bots × connections* so one link can keep every slot busy.
+- **Failover, not sleeping.** Flood-wait → that bot cools down and the chunk moves to another bot immediately. A getFile slower than `FETCH_ATTEMPT_TIMEOUT` is abandoned and retried elsewhere. Bots that keep failing are parked.
+- **Per-bot file references.** Telegram file references are bound to the account that fetched them (verified live: sharing one bot's reference made 13 of 20 bots fail with `FILE_REFERENCE_EXPIRED`). Each bot resolves the log message itself, caches its own location, and only that bot refreshes when Telegram rejects it.
+- **Adaptive concurrency.** A delivery-rate controller (BBR-style) grows the number of RPCs in flight while throughput keeps rising and settles just above the point where it plateaus. On a link slower than the bot fleet this prevents congestion collapse (chunks queueing past their deadline and being downloaded twice); Telegram's heavy latency jitter doesn't fool it. Exposed as `mtflux_fetch_concurrency_limit`.
+- **Urgent chunks first.** Queued chunks are served by distance from their reader's position, so every viewer's next-needed chunk beats anyone's deep read-ahead: a new viewer starts fast even when the server is busy.
+- **Shared chunk cache + dedup.** Concurrent viewers, seeks, and IDM/aria2's parallel connections share one fetch. A fetch is cancelled once *every* waiter has gone.
+- **Zero-copy path.** Cached chunk slices are written straight to the socket.
+- **Lean MTProto path.** The obfuscation layer (an extra AES-CTR pass over every byte) is off by default, and AES-IGE decryption uses a register-chained loop on arm64 (+23% on an Ampere A1; vendored in [third_party/ige](third_party/ige)). Download cost on one A1 core: **7.9 ms CPU per MiB** (~127 MB/s per core).
+- **Small-VPS friendly cold start.** Bots without a saved session log in a few at a time, and DC pools are created at most CPU-count at once, so a 1-core box doesn't stall generating 20 auth keys in parallel.
+
+Measured in-process against a 100 ms-latency fake Telegram with 20 bots × 4 conns (`go test ./internal/stream -run x -bench SingleStream -benchtime 1x`, 128 MiB):
+
+| stream window | single-link throughput |
+|---|---|
+| 4 | 39 MB/s |
+| 16 | 126 MB/s |
+| 32 | 206 MB/s |
+| 64 (auto for 20 bots) | **249 MB/s** (bounded by ramp-up on a 128 MiB file; approaches the 640 MB/s slot ceiling on longer files) |
+
+More simulations (`go test ./internal/fetch -run x -bench . -benchtime 1x`): on a link-limited host the adaptive limiter lifts goodput from 8.5 to 49.75 chunks/s (99.5% of the link) with zero re-downloads, and a second viewer's first byte drops from 2.9 s to 0.33 s.
+
+Real numbers depend on Telegram and your network: measure them with `mtbench` (below).
+
+### Live results
+
+**Oracle Cloud Ampere A1, 1 OCPU / 6 GB, US East (Ashburn), ~840 Mbit/s link; 20 worker bots, all homed on DC 5** (`mtbench`, 276 MiB per run):
+
+| File stored on | 1 connection | best raw sweep | **one download link** | what limits it |
+|---|---|---|---|---|
+| DC 1 (Miami, close) | 12.6 MB/s (78 ms per chunk) | 70 MB/s (5 bots × 2) | **95.7 MB/s** (~770 Mbit/s) | the VPS link; CPU at 0.64 cores |
+| DC 5 (Singapore, far) | 2.4 MB/s (~400 ms per chunk) | 25–35 MB/s | 17–24 MB/s | Telegram / the route; flat beyond ~10 bots × 2 |
+
+From a residential IP, the same DC 5 file gave a flat ~2–2.8 MB/s total whatever the bot count (an ISP-side ceiling; that run was also verified with SHA-256 across single-connection, `aria2c -x16` and cross-chunk range requests).
+
+What this means for deployment:
+
+- **The file's DC matters, the bots' DC doesn't.** A file lives on its uploader's DC; all 20 DC 5 bots pulled 96 MB/s from DC 1. Put the server near the DC your users upload to (India → DC 5 Singapore, Europe → DC 2/4 Amsterdam, Americas → DC 1/3 Miami).
+- **Per-connection speed is latency-bound.** `upload.getFile` returns at most 1 MiB, so throughput ≈ requests in flight × 1 MiB ÷ round trip.
+- **Each bot is rate-limited to roughly 20 getFile/s** (`FLOOD_WAIT_1` above ~20 MB/s from one bot). mtflux cools that bot down for the stated second and moves its chunks elsewhere; more bots spread the load.
+- **`CONNS_PER_BOT_PER_DC` above 2 only helps for DC 2/4 files.** Elsewhere pools hold 2 connections and extra requests just queue.
+- **First download from a new DC after a restart warms every bot.** Each bot generates an auth key for that DC (~2.7 s of CPU on an A1 core), so warm-up of 20 bots takes ~50 s on 1 OCPU. Downloads start on the first warm bot and speed up as the rest join.
+
+Run `mtbench` on your own VPS before tuning: if its raw sweep is flat as bots × connections grow, more bots won't help on that host.
+
+## Correctness & safety
+
+- **Chunk length is validated.** A chunk whose length isn't what the file size implies is retried (never cached, never forwarded), so a bad response can't silently corrupt a download.
+- **Errors get real status codes.** The first chunk is fetched *before* headers are sent: 410 (gone), 503 + `Retry-After` (upstream busy), 502. A failure after the body has started aborts the connection instead of delivering a plausible-looking short file.
+- **RFC 7233** Range (206/416), `If-Range`, strong `ETag`, `If-None-Match` (lists/weak), `HEAD`, RFC 6266/5987 `Content-Disposition`.
+- **Signed links.** Compact HMAC-SHA256 tokens with expiry (rounded *up* to the minute) and owner id. Revocation deletes the log-channel message; bans kill all of a user's links.
+- **Hardening.** `Cache-Control: private, no-cache` (revoked links can't be served from shared caches), `nosniff`, HTML/SVG/JS are always forced to download.
+- **Fail-closed config.** Typos in `ACCESS_MODE`, `SPEED_PROFILE`, `CHUNK_SIZE`, `DEFAULT_LINK_TTL` etc. are startup errors, not silent defaults. `LINK_SECRET` must be ≥16 chars and not the sample value.
 
 ---
 
@@ -25,17 +71,17 @@ mtflux changes the architecture:
 ```
             Telegram user ──file──▶ main bot (updates) ──sendMedia copy──▶ LOG CHANNEL (the "DB")
                                         │ replies with signed link            ▲ channels.getMessages
-                                        ▼                                     │ (per worker, cached)
+                                        ▼                                     │ (any healthy worker, cached)
 HTTP client ─GET /dl/{token}/{name}─▶ httpapi ─▶ resolver ─(FileMeta: size,dc,docID,name,mime)
      (Range)                            │
                                         ▼
                                stream.Reader (ordered sliding window, slow-start)
-                                        │ Fetch(file, chunkIdx)
+                                        │ FetchChunk(file, idx)
                                         ▼
-                     chunk cache (byte-budget LRU) + singleflight(docID,chunk)
+                     chunk cache (byte-budget LRU) + in-flight dedup (ref-counted)
                                         │ miss
                                         ▼
-                     scheduler: pick least-loaded healthy (worker, dc) with a free slot
+                     scheduler: warm (bot, dc) with a free slot, lowest load, lowest latency
                                         │
              ┌──────────────┬───────────┴──────┬──────────────┐
           bot1: MediaOnly(dc,M)  bot2: MediaOnly(dc,M)  …  botN   (each conn = 1 in-flight getFile)
@@ -43,60 +89,36 @@ HTTP client ─GET /dl/{token}/{name}─▶ httpapi ─▶ resolver ─(FileMeta
 
 ---
 
-## Speed Profiles
+## Quick start
 
-| Profile | Conns/Bot/DC ($M$) | Window Max | Target Throughput / Notes |
-|---|---|---|---|
-| `safe` | 2 | 4 | ~Official Telegram desktop level |
-| `fast` *(default)* | 4 | 16 | Optimal balance for VPS servers |
-| `extreme` | 8 | 32 | Nekogram-style extreme throughput |
+### 1. Telegram setup
+1. **API ID & hash** from [my.telegram.org](https://my.telegram.org).
+2. **Main bot** via [@BotFather](https://t.me/BotFather).
+3. **Worker bots**: up to 48 (`WORKER_TOKEN_1` … `WORKER_TOKEN_48`). More bots means more parallelism and less flood-wait pressure per bot.
+4. **Log channel**: a private channel with the **main bot and every worker bot as administrators**. Workers that can't read it are excluded at startup with a log line.
 
----
-
-## Quick Start
-
-### 1. Requirements & Telegram Setup
-1. **API ID & API Hash**: Obtain from [my.telegram.org](https://my.telegram.org).
-2. **Main Bot**: Create via [@BotFather](https://t.me/BotFather) (`/newbot`).
-3. **Worker Bots**: Create worker bots via [@BotFather] (up to 48 workers supported: `WORKER_TOKEN_1` through `WORKER_TOKEN_48`, utilizing the channel's 50-admin limit: 1 owner + 1 main bot + 48 workers).
-4. **Log Channel**:
-   - Create a private channel.
-   - Add your **main bot AND all worker bots as Channel Administrators** with full read/write/post permissions.
-   - Get the channel ID (usually formatted as `-100...`).
-
-### 2. Deployment with Docker Compose
+### 2. Deploy with Docker Compose
 
 ```bash
 git clone https://github.com/biohazard786/mtflux.git
-cd mtflux/deploy
-
-# Copy configuration
+cd mtflux
 cp .env.sample .env
-
-# Edit credentials in .env
-nano .env
-
-# Start container
+nano .env        # fill in tokens, LINK_SECRET (openssl rand -hex 32), PUBLIC_URL, OWNER_ID
 docker compose up -d
+docker compose logs -f mtflux     # shows the effective tuning + worker readiness
 ```
 
-### 3. Reverse Proxy Configuration (Caddy / Nginx)
+On the very first start the bots have no saved sessions and log in a few at a time; on a 1-core VPS 20 bots take 1–2 minutes. A `some workers did not become ready in time` warning is expected then: late workers join as soon as they finish. Later restarts reuse the sessions in the `mtflux_data` volume and are ready in about a second.
 
-mtflux exposes its HTTP port (default `8080`) to the host. Configure your global reverse proxy:
+The image is a 29 MB static binary running as a non-root user, with a built-in health check, a read-only root filesystem and a 45 s stop grace period (so SIGTERM can drain active downloads).
 
-**Caddy:**
-```caddy
-dl.yourdomain.com {
-    encode zstd gzip
+### 3. Reverse proxy (Caddy / nginx)
 
-    # Unbuffered streaming reverse proxy
-    reverse_proxy 127.0.0.1:8080 {
-        flush_interval -1
-    }
-}
-```
+Set `BIND_ADDR=127.0.0.1` in `.env` so mtflux is reachable only through the proxy. mtflux trusts `X-Forwarded-For` / `X-Real-IP` only from `TRUSTED_PROXIES` (default: loopback and private ranges, which covers a host proxy and Docker's bridge), so `MAX_STREAMS_PER_IP` applies per real client.
 
-**Nginx:**
+**Caddy**: see [Caddyfile](Caddyfile). Don't add `encode` (payloads are already compressed).
+
+**nginx:**
 ```nginx
 server {
     server_name dl.yourdomain.com;
@@ -105,67 +127,100 @@ server {
         proxy_pass http://127.0.0.1:8080;
         proxy_http_version 1.1;
         proxy_buffering off;
+        proxy_request_buffering off;
         proxy_read_timeout 300s;
         proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Real-IP $remote_addr;
     }
 }
 ```
 
-### 4. Local Development Build
+### 4. Local development
 
 ```bash
-# Build mtflux and benchmark harness
 go build -o bin/mtflux ./cmd/mtflux
 go build -o bin/mtbench ./cmd/mtbench
-
-# Run all unit tests with race detection
-go test -v -race ./...
+go test -race ./...
 ```
+
+`github.com/gotd/ige` is replaced by the patched copy in [third_party/ige](third_party/ige) (see its `README.mtflux`).
 
 ---
 
-## Benchmark Harness (`mtbench`)
+## Tuning
 
-To benchmark your worker bots and tune your profile defaults against an actual file:
+Everything is configured by environment (see [.env.sample](.env.sample)). The startup log prints the **effective** values (`workers`, `slots_per_dc`, `stream_window_min/max`).
+
+| Setting | Default | Notes |
+|---|---|---|
+| `SPEED_PROFILE` | `fast` | `safe` (2 conns), `fast` (4), `extreme` (8; highest flood risk) |
+| `CONNS_PER_BOT_PER_DC` | profile | Parallel getFile RPCs per bot per DC (**M**). Only media-only DCs (2, 4) use more than 2 |
+| `STREAM_WINDOW_MAX` | auto | Auto = bots × M, between the profile default and 64 |
+| `STREAM_WINDOW_MIN` | auto | Initial window; auto = max/8 clamped to 4–8 |
+| `STREAM_MAX_BOTS` | `0` (all) | Per-download cap on distinct bots; rotates across downloads |
+| `FETCH_ATTEMPT_TIMEOUT` | `10s` | A slower getFile is retried on another bot (stretched automatically on slow links) |
+| `MTPROTO_OBFUSCATION` | `false` | Obfuscated2 transport; enable only where Telegram is blocked (costs ~9% CPU) |
+| `MAX_BUFFER_MB` | `1024` | Read-ahead budget across all downloads |
+| `CHUNK_CACHE_MB` | `256` | Shared cache for seeks / parallel downloaders |
+
+Total in-flight RPCs are additionally capped by the adaptive limiter, so the settings above are ceilings, not targets. Go's heap is soft-limited to `MAX_BUFFER_MB + CHUNK_CACHE_MB + 512` MiB (unless you set `GOMEMLIMIT`). **Rule of thumb for the window:** it should be ≥ bots × M, otherwise slots sit idle. **Rule of thumb for M:** total slots = bots × M; once that exceeds what your VPS link can carry, extra connections only add flood-wait risk. 20 bots × 4 = 80 slots is already past 1 Gbit at typical per-connection speeds.
+
+### Benchmark with your own bots (`mtbench`)
+
+Send a large file (≥ 500 MB) to your bot, note its message id in the log channel, then:
 
 ```bash
-./bin/mtbench -msg <LOG_CHANNEL_MSG_ID> -conns 1,2,4,8 -chunks 32
+docker build --target bench -t mtflux-bench .
+docker run --rm --env-file .env -v mtflux_bench:/data mtflux-bench \
+  -msg <MESSAGE_ID> -nbots 1,5,10,20 -conns 1,2 -chunks 512 -windows 32,64
+# or locally: ./bin/mtbench -msg <MESSAGE_ID> ...
 ```
 
-Outputs live latency percentiles ($P_{50}, P_{90}$), throughput MB/s, and Media-DC connection diagnostics.
+What it reports:
+
+1. **Login**: per bot, its home DC and login time, or the exact error.
+2. **The file**: its DC, which DCs offer media-only addresses, and the pool type and slot count the first bot gets.
+3. **Warm-up**: how long it took for every bot to open a pool on the file's DC, and any bot that failed.
+4. **Phase 1**: raw `upload.getFile` throughput over *bots × connections*, with p50/p90 per chunk and the full first error of any failing bot.
+5. **Phase 2**: one download through the real scheduler and window, i.e. what a single link gets.
+6. **CPU usage** over phases 1+2: CPU ms per MiB, MB/s one core can sustain, bytes allocated per payload byte, GC count.
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `-nbots` | `1,half,all` | Bot counts to sweep |
+| `-conns` | `1,2,4,8` | Connections per bot to sweep |
+| `-chunks` | `64` | MiB per run (use the whole file for steady-state numbers) |
+| `-windows` | `16,32,64` | Phase 2 windows; `""` skips phase 2 |
+| `-auth-timeout` | `5m` | Wait for logins (a first login on a small VPS is slow) |
+| `-v` / `-vv` | off | Telegram connection logs at info / debug level |
+| `-cpuprofile`, `-memprofile` | off | pprof files for phases 1+2 (mount a writable dir, e.g. `-v ~/prof:/prof`, then `go tool pprof -top prof/cpu.pprof`) |
+
+`mtbench` keeps its own sessions under `DATA_DIR/bench`, so it is safe to run while the server is up.
 
 ---
 
-## Bot Commands
+## Bot commands
 
-- `/start` — Welcome message and instructions.
-- `/help` — Overview of commands and usage.
-- `/link <duration>` — Generate custom TTL link (e.g. `/link 6h`, `/link 2d`).
-- `/revoke <token_or_link>` — Delete the file from the log channel and revoke link.
-- `/stats` — *(Admin)* View uptime, worker status, in-flight chunks, cache hit rates.
-- `/allow <user_id>` — *(Admin)* Grant link generation access.
-- `/disallow <user_id>` — *(Admin)* Revoke user link generation access.
-- `/ban <user_id>` — *(Admin)* Ban user and invalidate all their links immediately.
-- `/unban <user_id>` — *(Admin)* Unban user.
+- `/start`, `/help`
+- Send any file → direct link.
+- `/link 6h`: custom lifetime. Use it as a **caption** on the file, as a **reply** to a file, or on its own (applies to your next file within 2 minutes). Units: `m`, `h`, `d`, `w`.
+- `/revoke <link>`: deletes the log message and revokes the link. Reports failure honestly if the delete didn't go through.
+- `/stats` *(admin)*: uptime, per-worker status/latency/throughput, cache hit rate.
+- `/allow`, `/disallow`, `/ban`, `/unban` `<user_id>` *(admin)*
 
----
+## HTTP endpoints
 
-## Prometheus Metrics (`/metrics`)
+- `GET|HEAD /dl/{token}/{name}`: download (`?inline=1` for inline disposition where safe)
+- `GET /healthz`: liveness. `GET /readyz`: 503 if no worker is healthy
+- `GET /metrics`: served on the public port **only** if `METRICS_AUTH_TOKEN` is set (bearer auth); otherwise set `METRICS_ADDR` (e.g. `127.0.0.1:9100`) for an internal, unauthenticated listener
 
-- `mtflux_bytes_served_total`: Total bytes served to clients.
-- `mtflux_chunk_fetch_seconds`: Histogram of chunk fetch latency by worker and DC.
-- `mtflux_chunk_errors_total`: Counter of errors classified by type.
-- `mtflux_flood_wait_seconds_total`: Total seconds of flood-wait per worker.
-- `mtflux_inflight_chunks`: Live gauge of in-flight chunk requests.
-- `mtflux_active_streams`: Current number of active client downloads.
-- `mtflux_cache_hits_total`, `mtflux_cache_misses_total`: Cache efficiency counters.
-- `mtflux_cache_bytes`: Current memory utilized by the LRU chunk cache.
+## Prometheus metrics
+
+`mtflux_bytes_served_total`, `mtflux_chunk_fetch_seconds{worker,dc}`, `mtflux_chunk_errors_total{class}`, `mtflux_flood_wait_seconds_total{worker}`, `mtflux_inflight_chunks{worker}`, `mtflux_active_streams`, `mtflux_cache_{hits,misses}_total`, `mtflux_cache_bytes`.
 
 ---
 
 ## License
 
 MIT
-

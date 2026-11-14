@@ -1,8 +1,10 @@
 package metrics
 
 import (
+	"crypto/subtle"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,15 +18,16 @@ import (
 type Metrics struct {
 	reg *prometheus.Registry
 
-	BytesServedTotal       prometheus.Counter
-	ChunkFetchDuration     *prometheus.HistogramVec
-	ChunkErrorsTotal       *prometheus.CounterVec
-	FloodWaitSecondsTotal  *prometheus.CounterVec
-	InflightChunks         *prometheus.GaugeVec
-	ActiveStreams          prometheus.Gauge
-	CacheHitsTotal         prometheus.Counter
-	CacheMissesTotal       prometheus.Counter
-	CacheBytes             prometheus.Gauge
+	BytesServedTotal      prometheus.Counter
+	ChunkFetchDuration    *prometheus.HistogramVec
+	ChunkErrorsTotal      *prometheus.CounterVec
+	FloodWaitSecondsTotal *prometheus.CounterVec
+	InflightChunks        *prometheus.GaugeVec
+	ActiveStreams         prometheus.Gauge
+	CacheHitsTotal        prometheus.Counter
+	CacheMissesTotal      prometheus.Counter
+	CacheBytes            prometheus.Gauge
+	FetchConcurrencyLimit prometheus.Gauge
 
 	// In-memory stats tracker for /stats admin command
 	startTime   time.Time
@@ -38,15 +41,15 @@ type Metrics struct {
 
 // WorkerStat captures live telemetry for a single worker bot.
 type WorkerStat struct {
-	ID             string
-	Status         string // "ok", "cooldown", "no_access", "broken"
-	Inflight       int
-	EwmaLatencyMs  float64
-	EwmaMBPerSec   float64
-	TotalBytes     uint64
-	FloodWaitSec   int64
-	CooldownUntil  time.Time
-	TargetDC       int
+	ID            string
+	Status        string // "ok", "cooldown", "no_access", "broken"
+	Inflight      int
+	EwmaLatencyMs float64
+	EwmaMBPerSec  float64
+	TotalBytes    uint64
+	FloodWaitSec  int64
+	CooldownUntil time.Time
+	TargetDC      int
 }
 
 // New initializes metrics and registers them with a dedicated registry.
@@ -92,6 +95,10 @@ func New() *Metrics {
 			Name: "mtflux_cache_bytes",
 			Help: "Current memory used by chunk cache in bytes.",
 		}),
+		FetchConcurrencyLimit: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "mtflux_fetch_concurrency_limit",
+			Help: "Adaptive limit on getFile RPCs in flight across all workers.",
+		}),
 
 		startTime:   time.Now(),
 		workerStats: make(map[string]*WorkerStat),
@@ -107,6 +114,7 @@ func New() *Metrics {
 		m.CacheHitsTotal,
 		m.CacheMissesTotal,
 		m.CacheBytes,
+		m.FetchConcurrencyLimit,
 	)
 
 	return m
@@ -140,7 +148,7 @@ func (m *Metrics) UpdateWorkerStat(ws WorkerStat) {
 	m.InflightChunks.WithLabelValues(ws.ID).Set(float64(ws.Inflight))
 }
 
-// FormatStats generates human-readable stats for Telegram admin /stats command.
+// FormatStats generates HTML-formatted stats for the Telegram admin /stats command.
 func (m *Metrics) FormatStats(activeStreams int) string {
 	uptime := time.Since(m.startTime).Truncate(time.Second)
 	totalBytes := m.totalBytes.Load()
@@ -153,36 +161,48 @@ func (m *Metrics) FormatStats(activeStreams int) string {
 	}
 
 	var sb strings.Builder
-	sb.WriteString("📊 *mtflux System Stats*\n\n")
-	sb.WriteString(fmt.Sprintf("• *Uptime*: `%s`\n", uptime))
-	sb.WriteString(fmt.Sprintf("• *Active Streams*: `%d`\n", activeStreams))
-	sb.WriteString(fmt.Sprintf("• *Total Served*: `%.2f GB`\n", float64(totalBytes)/(1024*1024*1024)))
-	sb.WriteString(fmt.Sprintf("• *Cache Hit Rate*: `%.1f%%` (`%d` hits / `%d` misses)\n\n", hitRate, hits, misses))
+	sb.WriteString("📊 <b>mtflux System Stats</b>\n\n")
+	sb.WriteString(fmt.Sprintf("• <b>Uptime:</b> <code>%s</code>\n", uptime))
+	sb.WriteString(fmt.Sprintf("• <b>Active streams:</b> <code>%d</code>\n", activeStreams))
+	sb.WriteString(fmt.Sprintf("• <b>Total served:</b> <code>%.2f GB</code>\n", float64(totalBytes)/(1024*1024*1024)))
+	sb.WriteString(fmt.Sprintf("• <b>Cache hit rate:</b> <code>%.1f%%</code> (<code>%d</code> hits / <code>%d</code> misses)\n\n", hitRate, hits, misses))
 
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	sb.WriteString("🤖 *Workers:*\n")
+	sb.WriteString("🤖 <b>Workers</b>\n")
 	if len(m.workerStats) == 0 {
-		sb.WriteString("_No active workers registered_\n")
-	} else {
-		for id, ws := range m.workerStats {
-			statusIcon := "🟢"
-			switch ws.Status {
-			case "cooldown":
-				statusIcon = "🟡"
-			case "no_access", "broken":
-				statusIcon = "🔴"
-			}
-
-			sb.WriteString(fmt.Sprintf("%s *%s* [%s]\n", statusIcon, id, ws.Status))
-			sb.WriteString(fmt.Sprintf("   In-flight: `%d` | Latency: `%.1fms`\n", ws.Inflight, ws.EwmaLatencyMs))
-			if ws.FloodWaitSec > 0 {
-				sb.WriteString(fmt.Sprintf("   Flood Wait: `%ds`\n", ws.FloodWaitSec))
-			}
-		}
+		sb.WriteString("<i>No workers registered</i>\n")
+		return sb.String()
 	}
 
+	ids := make([]string, 0, len(m.workerStats))
+	var okCount int
+	for id, ws := range m.workerStats {
+		ids = append(ids, id)
+		if ws.Status == "ok" {
+			okCount++
+		}
+	}
+	sort.Strings(ids)
+	sb.WriteString(fmt.Sprintf("<code>%d/%d</code> healthy\n\n", okCount, len(ids)))
+
+	for _, id := range ids {
+		ws := m.workerStats[id]
+		icon := "🟢"
+		switch ws.Status {
+		case "cooldown":
+			icon = "🟡"
+		case "no_access", "broken":
+			icon = "🔴"
+		}
+		sb.WriteString(fmt.Sprintf("%s <code>%s</code> [%s] inflight <code>%d</code> · <code>%.0fms</code> · <code>%.1f MB/s</code> · <code>%.2f GB</code>",
+			icon, id, ws.Status, ws.Inflight, ws.EwmaLatencyMs, ws.EwmaMBPerSec, float64(ws.TotalBytes)/(1024*1024*1024)))
+		if ws.FloodWaitSec > 0 {
+			sb.WriteString(fmt.Sprintf(" · flood <code>%ds</code>", ws.FloodWaitSec))
+		}
+		sb.WriteString("\n")
+	}
 	return sb.String()
 }
 
@@ -196,11 +216,10 @@ func (m *Metrics) Handler(authToken string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		authHeader := r.Header.Get("Authorization")
 		expected := "Bearer " + authToken
-		if authHeader != expected {
+		if subtle.ConstantTimeCompare([]byte(authHeader), []byte(expected)) != 1 {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
 		promHandler.ServeHTTP(w, r)
 	})
 }
-

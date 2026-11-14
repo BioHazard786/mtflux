@@ -1,11 +1,16 @@
-# Example Caddyfile configuration for your host's global Caddy:
-# (Replace dl.yourdomain.com with your actual public domain)
+# Example Caddyfile for your host's global Caddy.
+# (Replace dl.yourdomain.com with your actual public domain.)
+#
+# Set BIND_ADDR=127.0.0.1 in .env so mtflux is only reachable via this proxy.
+# Caddy sends X-Forwarded-For automatically; mtflux trusts it from private/loopback
+# peers (TRUSTED_PROXIES) so MAX_STREAMS_PER_IP applies per real client.
 
 dl.yourdomain.com {
-    encode zstd gzip
+    # Do NOT add `encode`: payloads are already-compressed media/archives and
+    # compression would burn CPU and interfere with Range responses.
 
-    # Unbuffered streaming reverse proxy to mtflux
     reverse_proxy 127.0.0.1:8080 {
+        # Stream bytes through as they arrive (no buffering)
         flush_interval -1
     }
 

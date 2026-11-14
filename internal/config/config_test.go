@@ -88,4 +88,3 @@ func TestConfigLoadAndProfiles(t *testing.T) {
 		t.Errorf("unexpected tokens order: %v", allTokens)
 	}
 }
-

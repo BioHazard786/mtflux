@@ -55,4 +55,3 @@ func TestMetricsAndHandler(t *testing.T) {
 		t.Errorf("metrics output missing mtflux_bytes_served_total: %s", body)
 	}
 }
-

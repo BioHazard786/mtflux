@@ -120,3 +120,17 @@ func FuzzTokenParse(f *testing.F) {
 	})
 }
 
+func TestTokenExpiryNeverEndsEarly(t *testing.T) {
+	secret := []byte("s3cret-for-expiry-rounding")
+	want := time.Unix((time.Now().Unix()/60+10)*60+59, 0) // 59s into a future minute
+	tok, err := Parse(secret, Generate(secret, 1, 1, want))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok.Expiry.Before(want) {
+		t.Fatalf("link expires %v before the requested %v", want.Sub(tok.Expiry), want)
+	}
+	if tok.Expiry.Sub(want) >= time.Minute {
+		t.Fatalf("rounded more than a minute late: %v", tok.Expiry.Sub(want))
+	}
+}

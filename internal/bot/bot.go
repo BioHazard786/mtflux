@@ -5,19 +5,17 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	stdhtml "html"
 	"math/big"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/gotd/contrib/middleware/floodwait"
-	"github.com/gotd/log/logzap"
-	"github.com/gotd/td/session"
-	"github.com/gotd/td/telegram"
-	"github.com/gotd/td/tg"
 	"github.com/biohazard786/mtflux/internal/access"
 	"github.com/biohazard786/mtflux/internal/config"
 	"github.com/biohazard786/mtflux/internal/fetch"
@@ -25,18 +23,50 @@ import (
 	"github.com/biohazard786/mtflux/internal/metrics"
 	"github.com/biohazard786/mtflux/internal/resolver"
 	gotgtg "github.com/biohazard786/mtflux/internal/tg"
+	"github.com/gotd/contrib/middleware/floodwait"
+	"github.com/gotd/log/logzap"
+	"github.com/gotd/td/session"
+	"github.com/gotd/td/telegram"
+	"github.com/gotd/td/telegram/message"
+	"github.com/gotd/td/telegram/message/html"
+	"github.com/gotd/td/tg"
+	"github.com/gotd/td/tgerr"
 	"go.uber.org/zap"
 )
+
+const (
+	// maxConcurrentHandlers bounds how many messages are processed at once so a
+	// burst (e.g. an album) is handled in parallel without unbounded goroutines.
+	maxConcurrentHandlers = 8
+	handlerTimeout        = 60 * time.Second
+	pendingTTLWindow      = 2 * time.Minute
+)
+
+type pendingTTL struct {
+	ttl   time.Duration
+	until time.Time
+}
 
 // Bot manages Telegram main bot updates, message ingest, commands, and link creation.
 type Bot struct {
 	cfg       *config.Config
 	client    *telegram.Client
+	waiter    *floodwait.Waiter
+	sender    *message.Sender
 	access    *access.Manager
 	resolver  *resolver.Resolver
 	scheduler *fetch.Scheduler
 	metrics   *metrics.Metrics
 	log       *zap.Logger
+
+	runCtx atomic.Pointer[context.Context]
+	sem    chan struct{}
+
+	logChannelID   atomic.Int64
+	logChannelHash atomic.Int64
+
+	pendingMu sync.Mutex
+	pending   map[int64]pendingTTL
 }
 
 // NewBot initializes the main Telegram control bot.
@@ -57,9 +87,7 @@ func NewBot(
 	if err := os.MkdirAll(sessionsDir, 0o700); err != nil {
 		return nil, fmt.Errorf("create sessions dir: %w", err)
 	}
-
-	sessionPath := filepath.Join(sessionsDir, "main_bot.json")
-	sessionStorage := &session.FileStorage{Path: sessionPath}
+	sessionStorage := &session.FileStorage{Path: filepath.Join(sessionsDir, "main_bot.json")}
 
 	b := &Bot{
 		cfg:       cfg,
@@ -68,48 +96,128 @@ func NewBot(
 		scheduler: sched,
 		metrics:   m,
 		log:       botLog,
+		sem:       make(chan struct{}, maxConcurrentHandlers),
+		pending:   make(map[int64]pendingTTL),
 	}
+	b.logChannelID.Store(gotgtg.ParseChannelID(cfg.LogChannelID))
 
 	dispatcher := tg.NewUpdateDispatcher()
 	dispatcher.OnNewMessage(b.handleNewMessage)
 
-	// Control plane uses floodwait middleware
-	waiter := floodwait.NewWaiter()
+	// Control plane rides the flood-wait middleware. The Waiter only works while
+	// its Run loop is active, so Start wraps the client in waiter.Run.
+	b.waiter = floodwait.NewWaiter()
 
-	opts := telegram.Options{
+	b.client = telegram.NewClient(cfg.AppID, cfg.AppHash, telegram.Options{
 		Resolver:       gotgtg.CreateResolver(),
 		SessionStorage: sessionStorage,
 		Logger:         logzap.New(botLog),
 		UpdateHandler:  dispatcher,
-		Middlewares: []telegram.Middleware{
-			waiter,
-		},
-	}
-
-	b.client = telegram.NewClient(cfg.AppID, cfg.AppHash, opts)
+		Middlewares:    []telegram.Middleware{b.waiter},
+	})
+	b.sender = message.NewSender(b.client.API())
 	return b, nil
 }
 
-// Start connects and runs the main bot.
+// Start connects and runs the main bot, restarting with backoff if the client
+// loop dies. It returns when ctx is cancelled or the token is rejected.
 func (b *Bot) Start(ctx context.Context, ready chan<- struct{}) error {
-	return b.client.Run(ctx, func(ctx context.Context) error {
-		status, err := b.client.Auth().Status(ctx)
-		if err != nil || !status.Authorized {
-			b.log.Info("logging in main bot")
-			if _, err := b.client.Auth().Bot(ctx, b.cfg.BotToken); err != nil {
-				return fmt.Errorf("main bot login failed: %w", err)
-			}
-		}
-
-		b.log.Info("main bot authenticated successfully")
+	var once sync.Once
+	signalReady := func() {
 		if ready != nil {
-			close(ready)
+			once.Do(func() { close(ready) })
+		}
+	}
+
+	backoff := time.Second
+	for {
+		err := b.waiter.Run(ctx, func(ctx context.Context) error {
+			return b.client.Run(ctx, func(ctx context.Context) error {
+				status, err := b.client.Auth().Status(ctx)
+				if err != nil || !status.Authorized {
+					b.log.Info("logging in main bot")
+					if _, err := b.client.Auth().Bot(ctx, b.cfg.BotToken); err != nil {
+						return &fatalError{err: fmt.Errorf("main bot login failed: %w", err)}
+					}
+				}
+				b.runCtx.Store(&ctx)
+				b.resolveLogChannel(ctx)
+
+				// Ask for the update state once so Telegram starts pushing
+				// updates to this session right away.
+				if _, err := b.client.API().UpdatesGetState(ctx); err != nil {
+					b.log.Warn("updates.getState failed", zap.Error(err))
+				}
+
+				username := ""
+				if self, err := b.client.Self(ctx); err == nil {
+					username = self.Username
+				}
+				b.log.Info("main bot authenticated successfully", zap.String("username", "@"+username))
+				backoff = time.Second
+				signalReady()
+
+				<-ctx.Done()
+				return ctx.Err()
+			})
+		})
+
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		var fe *fatalError
+		if errors.As(err, &fe) {
+			signalReady()
+			return fe.err
 		}
 
-		<-ctx.Done()
-		return ctx.Err()
-	})
+		b.log.Warn("main bot stopped, restarting", zap.Error(err), zap.Duration("in", backoff))
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoff):
+		}
+		if backoff < 30*time.Second {
+			backoff *= 2
+		}
+	}
 }
+
+type fatalError struct{ err error }
+
+func (e *fatalError) Error() string { return e.err.Error() }
+func (e *fatalError) Unwrap() error { return e.err }
+
+// resolveLogChannel learns this bot's access hash for the log channel; hashes
+// are per-account, so it can't be shared with the workers.
+func (b *Bot) resolveLogChannel(ctx context.Context) {
+	id := b.logChannelID.Load()
+	res, err := b.client.API().ChannelsGetChannels(ctx, []tg.InputChannelClass{
+		&tg.InputChannel{ChannelID: id},
+	})
+	if err != nil {
+		b.log.Warn("could not resolve log channel access hash (is the main bot an admin there?)", zap.Error(err))
+		return
+	}
+	for _, chat := range res.GetChats() {
+		if c, ok := chat.(*tg.Channel); ok && c.ID == id {
+			b.logChannelHash.Store(c.AccessHash)
+			b.log.Info("log channel resolved", zap.Int64("channel_id", id))
+			return
+		}
+	}
+	b.log.Warn("log channel not returned for the main bot; check it is a channel admin", zap.Int64("channel_id", id))
+}
+
+func (b *Bot) logChannel() *tg.InputChannel {
+	return &tg.InputChannel{ChannelID: b.logChannelID.Load(), AccessHash: b.logChannelHash.Load()}
+}
+
+func (b *Bot) logPeer() *tg.InputPeerChannel {
+	return &tg.InputPeerChannel{ChannelID: b.logChannelID.Load(), AccessHash: b.logChannelHash.Load()}
+}
+
+// ---- update handling -------------------------------------------------------
 
 func (b *Bot) handleNewMessage(ctx context.Context, e tg.Entities, u *tg.UpdateNewMessage) error {
 	msg, ok := u.Message.(*tg.Message)
@@ -122,164 +230,257 @@ func (b *Bot) handleNewMessage(ctx context.Context, e tg.Entities, u *tg.UpdateN
 		return nil
 	}
 
-	text := strings.TrimSpace(msg.Message)
-
-	// Handle commands
-	if strings.HasPrefix(text, "/") {
-		return b.handleCommand(ctx, msg, senderID, text)
-	}
-
-	// Handle media file upload
-	if msg.Media != nil {
-		return b.handleMediaUpload(ctx, msg, senderID, b.cfg.DefaultLinkTTL)
-	}
-
+	// Process off the update loop so a slow ingest never stalls other updates.
+	b.async(func(ctx context.Context) {
+		if err := b.dispatch(ctx, e, msg, senderID); err != nil {
+			b.log.Warn("message handling failed", zap.Int64("sender", senderID), zap.Error(err))
+		}
+	})
 	return nil
 }
 
-func (b *Bot) handleCommand(ctx context.Context, msg *tg.Message, senderID int64, text string) error {
-	parts := strings.Fields(text)
-	cmd := strings.ToLower(parts[0])
-	// Strip @botname if present
-	if idx := strings.IndexByte(cmd, '@'); idx != -1 {
-		cmd = cmd[:idx]
+func (b *Bot) async(fn func(ctx context.Context)) {
+	parent := context.Background()
+	if p := b.runCtx.Load(); p != nil {
+		parent = *p
+	}
+	go func() {
+		b.sem <- struct{}{}
+		defer func() { <-b.sem }()
+		ctx, cancel := context.WithTimeout(parent, handlerTimeout)
+		defer cancel()
+		fn(ctx)
+	}()
+}
+
+func (b *Bot) dispatch(ctx context.Context, e tg.Entities, msg *tg.Message, senderID int64) error {
+	text := strings.TrimSpace(msg.Message)
+	cmd, args := parseCommand(text)
+
+	if hasDownloadableMedia(msg.Media) {
+		// A caption of "/link 6h" sets the TTL for this very file.
+		ttl := b.cfg.DefaultLinkTTL
+		if cmd == "/link" {
+			if len(args) == 0 {
+				return b.reply(ctx, e, msg, "Usage: send a file with the caption <code>/link 6h</code>")
+			}
+			parsed, err := config.ParseTTL(args[0])
+			if err != nil {
+				return b.reply(ctx, e, msg, "❌ "+stdhtml.EscapeString(err.Error()))
+			}
+			ttl = parsed
+		} else if p, ok := b.takePending(senderID); ok {
+			ttl = p
+		}
+		return b.ingest(ctx, e, msg, msg.Media, senderID, ttl)
 	}
 
+	if cmd != "" {
+		return b.handleCommand(ctx, e, msg, senderID, cmd, args)
+	}
+	return nil
+}
+
+func (b *Bot) handleCommand(ctx context.Context, e tg.Entities, msg *tg.Message, senderID int64, cmd string, args []string) error {
 	switch cmd {
 	case "/start":
-		return b.reply(ctx, msg, "👋 *Welcome to mtflux!*\n\nSend or forward any file or video to get a blazing-fast direct download and streaming link powered by parallel chunk striping across multiple connections.\n\nUse `/help` for commands.")
+		return b.reply(ctx, e, msg, "👋 <b>Welcome to mtflux!</b>\n\nSend or forward any file or video to get a fast direct download and streaming link, served in parallel across many connections.\n\nUse /help for commands.")
 
 	case "/help":
-		helpText := "📖 *mtflux Commands:*\n\n" +
-			"• Send any media: generate direct download link\n" +
-			"• `/link <duration>`: customize TTL (e.g., `/link 6h`, `/link 2d`)\n" +
-			"• `/revoke <link/token>`: revoke and delete link immediately\n"
+		helpText := "📖 <b>mtflux commands</b>\n\n" +
+			"• Send any file: get a direct download link\n" +
+			"• <code>/link 6h</code> as a caption, or as a reply to a file: custom link lifetime (<code>30m</code>, <code>6h</code>, <code>7d</code>, <code>2w</code>)\n" +
+			"• <code>/revoke &lt;link&gt;</code>: revoke and delete a link immediately\n"
 		if b.access.IsAdmin(senderID) {
-			helpText += "\n👮 *Admin Commands:*\n" +
-				"• `/stats`: view live worker and download metrics\n" +
-				"• `/allow <user_id>`: grant user link access\n" +
-				"• `/disallow <user_id>`: remove user access\n" +
-				"• `/ban <user_id>`: ban user and revoke all their links\n" +
-				"• `/unban <user_id>`: unban user\n"
+			helpText += "\n👮 <b>Admin</b>\n" +
+				"• /stats: live worker and download metrics\n" +
+				"• <code>/allow &lt;user_id&gt;</code> / <code>/disallow &lt;user_id&gt;</code>\n" +
+				"• <code>/ban &lt;user_id&gt;</code> / <code>/unban &lt;user_id&gt;</code>: banning also kills all of that user's links\n"
 		}
-		return b.reply(ctx, msg, helpText)
+		return b.reply(ctx, e, msg, helpText)
 
 	case "/stats":
 		if !b.access.IsAdmin(senderID) {
-			return b.reply(ctx, msg, "⛔ Access denied.")
+			return b.reply(ctx, e, msg, "⛔ Access denied.")
 		}
-		stats := b.metrics.FormatStats(b.access.ActiveStreamsCount())
-		return b.reply(ctx, msg, stats)
+		return b.reply(ctx, e, msg, b.metrics.FormatStats(b.access.ActiveStreamsCount()))
 
 	case "/allow":
-		return b.handleAdminACL(ctx, msg, senderID, parts, b.access.Allow, "allowed")
+		return b.handleAdminACL(ctx, e, msg, senderID, cmd, args, b.access.Allow, "allowed")
 	case "/disallow":
-		return b.handleAdminACL(ctx, msg, senderID, parts, b.access.Disallow, "disallowed")
+		return b.handleAdminACL(ctx, e, msg, senderID, cmd, args, b.access.Disallow, "disallowed")
 	case "/ban":
-		return b.handleAdminACL(ctx, msg, senderID, parts, b.access.Ban, "banned")
+		return b.handleAdminACL(ctx, e, msg, senderID, cmd, args, b.access.Ban, "banned")
 	case "/unban":
-		return b.handleAdminACL(ctx, msg, senderID, parts, b.access.Unban, "unbanned")
+		return b.handleAdminACL(ctx, e, msg, senderID, cmd, args, b.access.Unban, "unbanned")
 
 	case "/revoke":
-		return b.handleRevoke(ctx, msg, senderID, parts)
+		return b.handleRevoke(ctx, e, msg, senderID, args)
 
 	case "/link":
-		// Custom TTL link request (e.g. /link 6h or /link 2d in reply to media)
-		if len(parts) < 2 {
-			return b.reply(ctx, msg, "Usage: `/link <duration>` (e.g. `/link 6h`, `/link 24h`, `/link 7d`)")
-		}
-		ttl, err := time.ParseDuration(parts[1])
-		if err != nil {
-			return b.reply(ctx, msg, "Invalid duration format. Use e.g. `2h`, `24h`, `7d`.")
-		}
-		// If replying to media, ingest that media with this TTL
-		if msg.ReplyTo != nil {
-			return b.reply(ctx, msg, "Please send or forward the file directly along with the command.")
-		}
-		return b.reply(ctx, msg, fmt.Sprintf("TTL set to `%v`. Now send your file.", ttl))
+		return b.handleLinkCommand(ctx, e, msg, senderID, args)
 	}
-
 	return nil
 }
 
-func (b *Bot) handleAdminACL(ctx context.Context, msg *tg.Message, senderID int64, parts []string, fn func(int64) error, action string) error {
-	if !b.access.IsAdmin(senderID) {
-		return b.reply(ctx, msg, "⛔ Admin access required.")
+// handleLinkCommand implements "/link <ttl>" sent as a reply to a file, or on
+// its own (applies to the next file the user sends within a couple of minutes).
+func (b *Bot) handleLinkCommand(ctx context.Context, e tg.Entities, msg *tg.Message, senderID int64, args []string) error {
+	if len(args) == 0 {
+		return b.reply(ctx, e, msg, "Usage: <code>/link 6h</code> (reply to a file, or send it before the file). Units: <code>m h d w</code>")
 	}
-	if len(parts) < 2 {
-		return b.reply(ctx, msg, fmt.Sprintf("Usage: `%s <user_id>`", parts[0]))
-	}
-	targetID, err := strconv.ParseInt(parts[1], 10, 64)
+	ttl, err := config.ParseTTL(args[0])
 	if err != nil {
-		return b.reply(ctx, msg, "Invalid user ID.")
+		return b.reply(ctx, e, msg, "❌ "+stdhtml.EscapeString(err.Error()))
 	}
-	if err := fn(targetID); err != nil {
-		return b.reply(ctx, msg, fmt.Sprintf("Error: %v", err))
+
+	if hdr, ok := msg.ReplyTo.(*tg.MessageReplyHeader); ok && hdr.ReplyToMsgID != 0 {
+		target, err := b.fetchReplied(ctx, e, msg, hdr.ReplyToMsgID)
+		if err != nil || target == nil || !hasDownloadableMedia(target.Media) {
+			return b.reply(ctx, e, msg, "❌ The message you replied to has no file.")
+		}
+		return b.ingest(ctx, e, msg, target.Media, senderID, ttl)
 	}
-	return b.reply(ctx, msg, fmt.Sprintf("✅ User `%d` has been %s.", targetID, action))
+
+	b.setPending(senderID, ttl)
+	return b.reply(ctx, e, msg, fmt.Sprintf("⏱ OK. The next file you send within %d minutes gets a link valid for <code>%s</code>.",
+		int(pendingTTLWindow.Minutes()), stdhtml.EscapeString(args[0])))
 }
 
-func (b *Bot) handleRevoke(ctx context.Context, msg *tg.Message, senderID int64, parts []string) error {
-	var tokenStr string
-	if len(parts) >= 2 {
-		tokenStr = extractTokenFromText(parts[1])
+func (b *Bot) setPending(userID int64, ttl time.Duration) {
+	b.pendingMu.Lock()
+	defer b.pendingMu.Unlock()
+	now := time.Now()
+	for id, p := range b.pending {
+		if now.After(p.until) {
+			delete(b.pending, id)
+		}
 	}
+	b.pending[userID] = pendingTTL{ttl: ttl, until: now.Add(pendingTTLWindow)}
+}
 
+func (b *Bot) takePending(userID int64) (time.Duration, bool) {
+	b.pendingMu.Lock()
+	defer b.pendingMu.Unlock()
+	p, ok := b.pending[userID]
+	if !ok {
+		return 0, false
+	}
+	delete(b.pending, userID)
+	if time.Now().After(p.until) {
+		return 0, false
+	}
+	return p.ttl, true
+}
+
+func (b *Bot) fetchReplied(ctx context.Context, e tg.Entities, msg *tg.Message, id int) (*tg.Message, error) {
+	ids := []tg.InputMessageClass{&tg.InputMessageID{ID: id}}
+
+	var res tg.MessagesMessagesClass
+	var err error
+	if p, ok := msg.PeerID.(*tg.PeerChannel); ok {
+		ch, found := e.Channels[p.ChannelID]
+		if !found {
+			return nil, errors.New("channel not in update entities")
+		}
+		res, err = b.client.API().ChannelsGetMessages(ctx, &tg.ChannelsGetMessagesRequest{
+			Channel: &tg.InputChannel{ChannelID: ch.ID, AccessHash: ch.AccessHash},
+			ID:      ids,
+		})
+	} else {
+		res, err = b.client.API().MessagesGetMessages(ctx, ids)
+	}
+	if err != nil {
+		return nil, err
+	}
+	for _, m := range gotgtg.MessagesFrom(res) {
+		if mm, ok := m.(*tg.Message); ok {
+			return mm, nil
+		}
+	}
+	return nil, nil
+}
+
+func (b *Bot) handleAdminACL(ctx context.Context, e tg.Entities, msg *tg.Message, senderID int64, cmd string, args []string, fn func(int64) error, action string) error {
+	if !b.access.IsAdmin(senderID) {
+		return b.reply(ctx, e, msg, "⛔ Admin access required.")
+	}
+	if len(args) < 1 {
+		return b.reply(ctx, e, msg, fmt.Sprintf("Usage: <code>%s &lt;user_id&gt;</code>", cmd))
+	}
+	targetID, err := strconv.ParseInt(args[0], 10, 64)
+	if err != nil {
+		return b.reply(ctx, e, msg, "Invalid user ID.")
+	}
+	if cmd == "/ban" && (b.access.IsOwner(targetID) || targetID == senderID) {
+		return b.reply(ctx, e, msg, "⛔ You can't ban the owner or yourself.")
+	}
+	if err := fn(targetID); err != nil {
+		return b.reply(ctx, e, msg, "Error: "+stdhtml.EscapeString(err.Error()))
+	}
+	return b.reply(ctx, e, msg, fmt.Sprintf("✅ User <code>%d</code> has been %s.", targetID, action))
+}
+
+func (b *Bot) handleRevoke(ctx context.Context, e tg.Entities, msg *tg.Message, senderID int64, args []string) error {
+	var tokenStr string
+	if len(args) >= 1 {
+		tokenStr = extractTokenFromText(args[0])
+	}
 	if tokenStr == "" {
-		return b.reply(ctx, msg, "Usage: `/revoke <token_or_link>`")
+		return b.reply(ctx, e, msg, "Usage: <code>/revoke &lt;link&gt;</code>")
 	}
 
 	tok, err := link.Parse([]byte(b.cfg.LinkSecret), tokenStr)
-	if err != nil && !errors.Is(err, link.ErrTokenExpired) {
-		return b.reply(ctx, msg, "❌ Invalid link token.")
+	if tok == nil || (err != nil && !errors.Is(err, link.ErrTokenExpired)) {
+		return b.reply(ctx, e, msg, "❌ Invalid link.")
 	}
 
-	// Only owner or admin can revoke
+	// Only the owner of the link or an admin can revoke
 	if tok.OwnerID != senderID && !b.access.IsAdmin(senderID) {
-		return b.reply(ctx, msg, "⛔ You are not authorized to revoke this link.")
+		return b.reply(ctx, e, msg, "⛔ You are not authorized to revoke this link.")
 	}
 
-	// Delete from log channel
-	cleanChannelID := gotgtg.ParseChannelID(b.cfg.LogChannelID)
+	// The log channel message *is* the record: deleting it is the revocation.
 	_, err = b.client.API().ChannelsDeleteMessages(ctx, &tg.ChannelsDeleteMessagesRequest{
-		Channel: &tg.InputChannel{ChannelID: cleanChannelID, AccessHash: 0},
+		Channel: b.logChannel(),
 		ID:      []int{tok.MsgID},
 	})
-	if err != nil {
-		b.log.Warn("failed to delete message from log channel", zap.Int("msg_id", tok.MsgID), zap.Error(err))
+	if err != nil && !tgerr.Is(err, "MESSAGE_ID_INVALID") {
+		// Don't claim success: the link would come back once the negative cache expires.
+		b.log.Error("failed to delete message from log channel", zap.Int("msg_id", tok.MsgID), zap.Error(err))
+		return b.reply(ctx, e, msg, "❌ Could not revoke the link right now (the log channel refused the delete). Please try again.")
 	}
 
-	// Invalidate resolver and chunk cache
-	b.resolver.Invalidate(tok.MsgID)
-
-	return b.reply(ctx, msg, "🗑️ *Link revoked.* The file and link have been removed.")
+	if docID, ok := b.resolver.Invalidate(tok.MsgID); ok {
+		b.scheduler.EvictDoc(docID)
+	}
+	return b.reply(ctx, e, msg, "🗑️ <b>Link revoked.</b> The file and its link have been removed.")
 }
 
-func (b *Bot) handleMediaUpload(ctx context.Context, msg *tg.Message, senderID int64, ttl time.Duration) error {
+// ---- ingest ----------------------------------------------------------------
+
+func (b *Bot) ingest(ctx context.Context, e tg.Entities, cmdMsg *tg.Message, media tg.MessageMediaClass, senderID int64, ttl time.Duration) error {
 	if !b.access.CanGenerateLink(senderID) {
-		return b.reply(ctx, msg, "⛔ You do not have permission to generate download links.")
+		return b.reply(ctx, e, cmdMsg, "⛔ You do not have permission to generate download links.")
 	}
-
 	if !b.access.CheckRateLimit(senderID) {
-		return b.reply(ctx, msg, "⚠️ Rate limit reached. Please wait a few seconds before uploading another file.")
+		return b.reply(ctx, e, cmdMsg, "⚠️ Rate limit reached. Please wait a few seconds before sending more files.")
 	}
 
-	var inputMedia tg.InputMediaClass
-	var filename string
-	var fileSize int64
+	var (
+		inputMedia tg.InputMediaClass
+		filename   string
+		fileSize   int64
+	)
 
-	switch media := msg.Media.(type) {
+	switch m := media.(type) {
 	case *tg.MessageMediaDocument:
-		doc, ok := media.Document.AsNotEmpty()
+		doc, ok := m.Document.AsNotEmpty()
 		if !ok {
-			return b.reply(ctx, msg, "❌ Unsupported document format.")
+			return b.reply(ctx, e, cmdMsg, "❌ Unsupported document format.")
 		}
 		inputMedia = &tg.InputMediaDocument{
-			ID: &tg.InputDocument{
-				ID:            doc.ID,
-				AccessHash:    doc.AccessHash,
-				FileReference: doc.FileReference,
-			},
+			ID: &tg.InputDocument{ID: doc.ID, AccessHash: doc.AccessHash, FileReference: doc.FileReference},
 		}
 		fileSize = doc.Size
 		for _, attr := range doc.Attributes {
@@ -293,43 +494,35 @@ func (b *Bot) handleMediaUpload(ctx context.Context, msg *tg.Message, senderID i
 		}
 
 	case *tg.MessageMediaPhoto:
-		photo, ok := media.Photo.AsNotEmpty()
+		photo, ok := m.Photo.AsNotEmpty()
 		if !ok {
-			return b.reply(ctx, msg, "❌ Unsupported photo format.")
+			return b.reply(ctx, e, cmdMsg, "❌ Unsupported photo format.")
 		}
 		inputMedia = &tg.InputMediaPhoto{
-			ID: &tg.InputPhoto{
-				ID:            photo.ID,
-				AccessHash:    photo.AccessHash,
-				FileReference: photo.FileReference,
-			},
+			ID: &tg.InputPhoto{ID: photo.ID, AccessHash: photo.AccessHash, FileReference: photo.FileReference},
 		}
 		filename = fmt.Sprintf("photo_%d.jpg", photo.ID)
 
 	default:
-		return b.reply(ctx, msg, "❌ Please send a valid document, audio, video, or photo.")
+		return b.reply(ctx, e, cmdMsg, "❌ Please send a document, audio, video, or photo.")
 	}
 
-	// Send copy of media to log channel with caption #u<senderID>
-	cleanChannelID := gotgtg.ParseChannelID(b.cfg.LogChannelID)
-	logPeer := &tg.InputPeerChannel{ChannelID: cleanChannelID, AccessHash: 0}
-
+	// Copy (not forward) into the log channel, tagged with the owner.
 	randID, _ := rand.Int(rand.Reader, big.NewInt(1<<62))
 	updates, err := b.client.API().MessagesSendMedia(ctx, &tg.MessagesSendMediaRequest{
-		Peer:     logPeer,
+		Peer:     b.logPeer(),
 		Media:    inputMedia,
 		Message:  fmt.Sprintf("#u%d", senderID),
 		RandomID: randID.Int64(),
 	})
-
 	if err != nil {
 		b.log.Error("failed to copy media to log channel", zap.Error(err))
-		return b.reply(ctx, msg, "❌ Failed to store media into log channel. Please make sure the bot is an admin in the log channel.")
+		return b.reply(ctx, e, cmdMsg, "❌ Failed to store the file. Please make sure the bot is an admin of the log channel.")
 	}
 
 	logMsgID := extractMsgIDFromUpdates(updates)
 	if logMsgID == 0 {
-		return b.reply(ctx, msg, "❌ Failed to retrieve message ID from log channel.")
+		return b.reply(ctx, e, cmdMsg, "❌ Failed to retrieve the stored message ID from the log channel.")
 	}
 
 	var expiry time.Time
@@ -338,49 +531,55 @@ func (b *Bot) handleMediaUpload(ctx context.Context, msg *tg.Message, senderID i
 	}
 
 	token := link.Generate([]byte(b.cfg.LinkSecret), logMsgID, senderID, expiry)
-	encodedName := url.PathEscape(filename)
-	dlURL := fmt.Sprintf("%s/dl/%s/%s", b.cfg.PublicURL, token, encodedName)
-	streamURL := fmt.Sprintf("%s?inline=1", dlURL)
+	b.log.Info("link created",
+		zap.Int("log_msg_id", logMsgID), zap.Int64("owner", senderID),
+		zap.String("file", filename), zap.Int64("size", fileSize), zap.Duration("ttl", ttl))
+	dlURL := fmt.Sprintf("%s/dl/%s/%s", b.cfg.PublicURL, token, url.PathEscape(filename))
+	streamURL := dlURL + "?inline=1"
 
 	var sb strings.Builder
-	sb.WriteString("⚡ *Download Link Generated!*\n\n")
-	sb.WriteString(fmt.Sprintf("📁 *Name:* `%s`\n", filename))
+	sb.WriteString("⚡ <b>Download link ready</b>\n\n")
+	fmt.Fprintf(&sb, "📁 <b>Name:</b> <code>%s</code>\n", stdhtml.EscapeString(filename))
 	if fileSize > 0 {
-		sb.WriteString(fmt.Sprintf("📦 *Size:* `%.2f MB`\n", float64(fileSize)/(1024*1024)))
+		fmt.Fprintf(&sb, "📦 <b>Size:</b> <code>%s</code>\n", humanSize(fileSize))
 	}
 	if !expiry.IsZero() {
-		sb.WriteString(fmt.Sprintf("⏱️ *Expires:* `%s`\n", expiry.UTC().Format("2006-01-02 15:04 UTC")))
+		fmt.Fprintf(&sb, "⏱ <b>Expires:</b> <code>%s</code>\n", expiry.UTC().Format("2006-01-02 15:04 UTC"))
 	} else {
-		sb.WriteString("⏱️ *Expires:* `Never`\n")
+		sb.WriteString("⏱ <b>Expires:</b> <code>never</code>\n")
 	}
+	sb.WriteString("\n")
+	fmt.Fprintf(&sb, "📥 <a href=\"%s\">Download</a>\n", stdhtml.EscapeString(dlURL))
+	fmt.Fprintf(&sb, "▶️ <a href=\"%s\">Stream</a>\n\n", stdhtml.EscapeString(streamURL))
+	fmt.Fprintf(&sb, "<code>%s</code>", stdhtml.EscapeString(dlURL))
 
-	sb.WriteString("\n🚀 *Direct Links:*\n")
-	sb.WriteString(fmt.Sprintf("📥 [Fast Download](%s)\n", dlURL))
-	sb.WriteString(fmt.Sprintf("▶️ [Direct Stream / Web Player](%s)\n\n", streamURL))
-	sb.WriteString(fmt.Sprintf("`%s`\n", dlURL))
-
-	return b.reply(ctx, msg, sb.String())
+	return b.reply(ctx, e, cmdMsg, sb.String())
 }
 
-func (b *Bot) reply(ctx context.Context, msg *tg.Message, text string) error {
-	peer := b.getInputPeer(msg)
-	randID, _ := rand.Int(rand.Reader, big.NewInt(1<<62))
+// ---- helpers ---------------------------------------------------------------
 
-	_, err := b.client.API().MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
-		Peer:     peer,
-		Message:  text,
-		ReplyTo:  &tg.InputReplyToMessage{ReplyToMsgID: msg.ID},
-		RandomID: randID.Int64(),
-	})
+// reply sends an HTML-formatted reply (no link preview).
+func (b *Bot) reply(ctx context.Context, e tg.Entities, msg *tg.Message, htmlText string) error {
+	_, err := b.sender.To(b.inputPeer(e, msg)).Reply(msg.ID).NoWebpage().StyledText(ctx, html.String(nil, htmlText))
 	return err
 }
 
-func (b *Bot) getInputPeer(msg *tg.Message) tg.InputPeerClass {
+// inputPeer addresses the chat of msg with the access hash Telegram gave us in
+// the update, falling back to 0 only when the entity is missing.
+func (b *Bot) inputPeer(e tg.Entities, msg *tg.Message) tg.InputPeerClass {
 	switch p := msg.PeerID.(type) {
 	case *tg.PeerUser:
-		return &tg.InputPeerUser{UserID: p.UserID, AccessHash: 0}
+		var hash int64
+		if u, ok := e.Users[p.UserID]; ok {
+			hash = u.AccessHash
+		}
+		return &tg.InputPeerUser{UserID: p.UserID, AccessHash: hash}
 	case *tg.PeerChannel:
-		return &tg.InputPeerChannel{ChannelID: p.ChannelID, AccessHash: 0}
+		var hash int64
+		if c, ok := e.Channels[p.ChannelID]; ok {
+			hash = c.AccessHash
+		}
+		return &tg.InputPeerChannel{ChannelID: p.ChannelID, AccessHash: hash}
 	case *tg.PeerChat:
 		return &tg.InputPeerChat{ChatID: p.ChatID}
 	default:
@@ -400,6 +599,40 @@ func (b *Bot) extractSenderID(msg *tg.Message) int64 {
 	return 0
 }
 
+func hasDownloadableMedia(m tg.MessageMediaClass) bool {
+	switch m.(type) {
+	case *tg.MessageMediaDocument, *tg.MessageMediaPhoto:
+		return true
+	}
+	return false
+}
+
+// parseCommand splits "/cmd@botname arg1 arg2" into ("/cmd", [arg1 arg2]).
+func parseCommand(text string) (string, []string) {
+	if !strings.HasPrefix(text, "/") {
+		return "", nil
+	}
+	parts := strings.Fields(text)
+	cmd := strings.ToLower(parts[0])
+	if idx := strings.IndexByte(cmd, '@'); idx != -1 {
+		cmd = cmd[:idx]
+	}
+	return cmd, parts[1:]
+}
+
+func humanSize(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for v := n / unit; v >= unit; v /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.2f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
+}
+
 func extractTokenFromText(text string) string {
 	text = strings.TrimSpace(text)
 	if strings.Contains(text, "/dl/") {
@@ -408,6 +641,9 @@ func extractTokenFromText(text string) string {
 			tokenPart := parts[1]
 			if slash := strings.IndexByte(tokenPart, '/'); slash != -1 {
 				return tokenPart[:slash]
+			}
+			if q := strings.IndexByte(tokenPart, '?'); q != -1 {
+				return tokenPart[:q]
 			}
 			return tokenPart
 		}

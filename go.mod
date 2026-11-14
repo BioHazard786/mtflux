@@ -59,3 +59,6 @@ require (
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	rsc.io/qr v0.2.0 // indirect
 )
+
+// Vendored with an arm64 IGE speedup; see third_party/ige/README.mtflux.
+replace github.com/gotd/ige => ./third_party/ige

@@ -22,7 +22,7 @@ func TestParseRange(t *testing.T) {
 		{"bytes=-1500", 0, 999, nil}, // suffix larger than file
 		{"bytes=0-0", 0, 0, nil},
 		{"bytes=999-999", 999, 999, nil},
-		{"bytes=0-2000", 0, 999, nil}, // clamp to totalSize-1
+		{"bytes=0-2000", 0, 999, nil},             // clamp to totalSize-1
 		{"bytes=100-200, 300-400", 100, 200, nil}, // multi-range: first range served
 		{"", 0, 999, ErrNoRangeHeader},
 		{"bytes=1000-", 0, 0, ErrRangeUnsatisfiable}, // start >= total
@@ -93,4 +93,3 @@ func FuzzParseRange(f *testing.F) {
 		}
 	})
 }
-

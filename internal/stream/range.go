@@ -8,8 +8,8 @@ import (
 )
 
 var (
-	ErrNoRangeHeader    = errors.New("no Range header present")
-	ErrInvalidRange     = errors.New("invalid Range header format")
+	ErrNoRangeHeader      = errors.New("no Range header present")
+	ErrInvalidRange       = errors.New("invalid Range header format")
 	ErrRangeUnsatisfiable = errors.New("range not satisfiable")
 )
 
@@ -116,4 +116,3 @@ func ChunkBounds(start, end, chunkSize int64) (startChunk, endChunk int, firstCh
 	lastChunkEnd = end % chunkSize
 	return
 }
-

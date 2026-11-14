@@ -17,16 +17,16 @@ const (
 )
 
 var (
-	ErrInvalidToken = errors.New("invalid link token")
-	ErrTokenExpired = errors.New("link has expired")
+	ErrInvalidToken  = errors.New("invalid link token")
+	ErrTokenExpired  = errors.New("link has expired")
 	ErrTamperedToken = errors.New("token verification failed")
 )
 
 // Token represents the decoded contents of a link token.
 type Token struct {
-	MsgID    int
-	OwnerID  int64
-	Expiry   time.Time // Zero value means never expires
+	MsgID   int
+	OwnerID int64
+	Expiry  time.Time // Zero value means never expires
 }
 
 // Generate creates a signed, compact URL-safe token.
@@ -35,9 +35,11 @@ func Generate(secret []byte, msgID int, ownerID int64, expiry time.Time) string 
 	buf := make([]byte, 1, 32)
 	buf[0] = tokenVersion
 
+	// Expiry has minute resolution. Round up so a link is never cut short
+	// (floor would let a "1m" link die after as little as one second).
 	var expMin uint64
 	if !expiry.IsZero() {
-		expMin = uint64(expiry.Unix() / 60)
+		expMin = uint64((expiry.Unix() + 59) / 60)
 	}
 
 	var tmp [binary.MaxVarintLen64]byte
@@ -124,4 +126,3 @@ func computeMAC(secret, payload []byte) []byte {
 	sum := h.Sum(nil)
 	return sum[:macLen]
 }
-

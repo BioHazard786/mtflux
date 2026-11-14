@@ -117,4 +117,3 @@ func TestByteLRU_Concurrency(t *testing.T) {
 		t.Errorf("budget exceeded: %d", lru.UsedBytes())
 	}
 }
-

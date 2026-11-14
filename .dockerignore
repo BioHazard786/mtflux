@@ -1,0 +1,20 @@
+# Never ship secrets or live sessions into a build context
+.env
+.env.*
+**/.env
+**/.env.*
+data/
+**/data/
+*.session
+*.json.tmp*
+
+.git/
+.github/
+.vscode/
+.idea/
+bin/
+*.test
+*.md
+!README.md
+prof/
+*.pprof

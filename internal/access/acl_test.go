@@ -194,4 +194,3 @@ func TestConcurrentStreamLimits(t *testing.T) {
 		t.Errorf("expected 0 active streams, got %d", m.ActiveStreamsCount())
 	}
 }
-

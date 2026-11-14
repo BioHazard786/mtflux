@@ -10,10 +10,10 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/gotd/td/tgerr"
 	"github.com/biohazard786/mtflux/internal/fetch"
 	"github.com/biohazard786/mtflux/internal/resolver"
 	gotgtg "github.com/biohazard786/mtflux/internal/tg"
+	"github.com/gotd/td/tgerr"
 	"go.uber.org/zap"
 )
 
@@ -45,7 +45,7 @@ func (s *simulatedEngineSource) FetchFromWorker(ctx context.Context, worker *got
 }
 
 func TestStreamEngine_OrderedAssemblyAndTrimming(t *testing.T) {
-	const chunkSize = 1024 * 1024 // 1 MiB
+	const chunkSize = 1024 * 1024     // 1 MiB
 	const totalSize = 5 * 1024 * 1024 // 5 MiB
 
 	// Generate deterministic test payload
@@ -107,7 +107,7 @@ func TestStreamEngine_OrderedAssemblyAndTrimming(t *testing.T) {
 }
 
 func TestStreamEngine_50ConcurrentStreams(t *testing.T) {
-	const chunkSize = 256 * 1024 // 256 KiB for speed
+	const chunkSize = 256 * 1024  // 256 KiB for speed
 	const totalSize = 1024 * 1024 // 1 MiB
 
 	payload := make([]byte, totalSize)

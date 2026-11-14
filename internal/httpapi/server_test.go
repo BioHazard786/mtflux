@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gotd/td/tg"
 	"github.com/biohazard786/mtflux/internal/access"
 	"github.com/biohazard786/mtflux/internal/config"
 	"github.com/biohazard786/mtflux/internal/fetch"
@@ -17,6 +16,7 @@ import (
 	"github.com/biohazard786/mtflux/internal/resolver"
 	"github.com/biohazard786/mtflux/internal/stream"
 	gotgtg "github.com/biohazard786/mtflux/internal/tg"
+	"github.com/gotd/td/tg"
 	"go.uber.org/zap"
 )
 

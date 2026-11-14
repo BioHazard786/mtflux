@@ -2,6 +2,7 @@ package bot
 
 import (
 	"testing"
+	"time"
 
 	"github.com/gotd/td/tg"
 )
@@ -47,3 +48,63 @@ func TestExtractMsgIDFromUpdates(t *testing.T) {
 	}
 }
 
+func TestParseCommand(t *testing.T) {
+	cases := []struct {
+		in   string
+		cmd  string
+		args []string
+	}{
+		{"/link 6h", "/link", []string{"6h"}},
+		{"/Link@MyBot 2d", "/link", []string{"2d"}},
+		{"/revoke  abc ", "/revoke", []string{"abc"}},
+		{"/start", "/start", nil},
+		{"hello /link", "", nil},
+		{"", "", nil},
+	}
+	for _, c := range cases {
+		cmd, args := parseCommand(c.in)
+		if cmd != c.cmd || len(args) != len(c.args) {
+			t.Errorf("parseCommand(%q) = %q %v; want %q %v", c.in, cmd, args, c.cmd, c.args)
+			continue
+		}
+		for i := range args {
+			if args[i] != c.args[i] {
+				t.Errorf("parseCommand(%q) args = %v", c.in, args)
+			}
+		}
+	}
+}
+
+func TestExtractTokenIgnoresQueryString(t *testing.T) {
+	if got := extractTokenFromText("https://dl.example.com/dl/TOKEN123/movie.mp4?inline=1"); got != "TOKEN123" {
+		t.Errorf("got %q", got)
+	}
+	if got := extractTokenFromText("https://dl.example.com/dl/TOKEN123?inline=1"); got != "TOKEN123" {
+		t.Errorf("got %q", got)
+	}
+}
+
+func TestPendingTTLIsConsumedOnce(t *testing.T) {
+	b := &Bot{pending: map[int64]pendingTTL{}}
+	b.setPending(42, 6*time.Hour)
+
+	if ttl, ok := b.takePending(42); !ok || ttl != 6*time.Hour {
+		t.Fatalf("takePending = %v, %v", ttl, ok)
+	}
+	if _, ok := b.takePending(42); ok {
+		t.Fatal("a pending TTL must apply to one file only")
+	}
+
+	b.pending[7] = pendingTTL{ttl: time.Hour, until: time.Now().Add(-time.Second)}
+	if _, ok := b.takePending(7); ok {
+		t.Fatal("expired pending TTL must not apply")
+	}
+}
+
+func TestHumanSize(t *testing.T) {
+	for in, want := range map[int64]string{512: "512 B", 1536: "1.50 KiB", 5 << 20: "5.00 MiB", 3 << 30: "3.00 GiB"} {
+		if got := humanSize(in); got != want {
+			t.Errorf("humanSize(%d) = %q want %q", in, got, want)
+		}
+	}
+}

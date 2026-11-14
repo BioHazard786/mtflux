@@ -149,7 +149,9 @@ func Classify(err error) *ClassifiedError {
 	errStr := strings.ToUpper(err.Error())
 	if strings.Contains(errStr, "FLOOD_WAIT") || strings.Contains(errStr, "FLOOD_PREMIUM_WAIT") {
 		res.Class = ClassFloodWait
-		secs := extractNumber(errStr)
+		// Read the number after WAIT, not the first number in the string
+		// ("rpc error code 420: FLOOD_WAIT (1)" must give 1, not 420).
+		secs := extractNumber(errStr[strings.LastIndex(errStr, "WAIT"):])
 		if secs <= 0 {
 			secs = 1
 		}
@@ -197,4 +199,3 @@ func extractNumber(s string) int {
 	val, _ := strconv.Atoi(numStr.String())
 	return val
 }
-
