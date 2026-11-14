@@ -28,6 +28,7 @@ const (
 	maxFailedAttempts     = 6
 	retryTick             = 100 * time.Millisecond
 	prewarmCooldown       = 3 * time.Second
+	warmPoll              = 50 * time.Millisecond
 )
 
 // ChunkSource defines an interface for fetching raw chunk bytes.
@@ -104,6 +105,11 @@ type Scheduler struct {
 
 	warmMu   sync.Mutex
 	warmedAt map[int64]time.Time
+	warming  map[int]int   // dc -> pool warm-ups in flight
+	warmErr  map[int]error // dc -> last warm-up failure
+
+	// poolReady reports whether a worker already has a pool for dc.
+	poolReady func(w *gotgtg.Worker, dc int) bool
 }
 
 // NewScheduler creates a chunk fetch Scheduler.
@@ -149,6 +155,9 @@ func NewScheduler(
 		used:           make(map[slotKey]int),
 		calls:          make(map[ChunkKey]*call),
 		warmedAt:       make(map[int64]time.Time),
+		warming:        make(map[int]int),
+		warmErr:        make(map[int]error),
+		poolReady:      func(w *gotgtg.Worker, dc int) bool { return w.PoolReady(dc) },
 	}
 }
 
@@ -318,6 +327,24 @@ func (s *Scheduler) fetchWithRetries(ctx context.Context, meta *resolver.FileMet
 		worker, err := s.acquire(ctx, dc, stripe, prio)
 		if err != nil {
 			return nil, joinErr(lastErr, err)
+		}
+
+		// No bot has a pool for this DC yet (first download from it since the
+		// restart, or the warm bots are all cooling down). Don't tie the chunk
+		// to this particular bot: pools are created a few at a time and its
+		// turn may be far down the queue. Wait for whichever bot is ready
+		// first and take that one.
+		if _, canWarm := s.source.(Warmer); canWarm && !s.poolReady(worker, dc) {
+			s.release(worker, dc)
+			if err := s.waitWarm(ctx, meta, stripe); err != nil {
+				if ctx.Err() != nil {
+					return nil, joinErr(lastErr, ctx.Err())
+				}
+				lastErr = err
+				failures++
+				s.log.Warn("no bot could open a pool", zap.Int("dc", dc), zap.Int("failures", failures), zap.Error(err))
+			}
+			continue
 		}
 
 		s.mu.Lock()
@@ -511,34 +538,106 @@ func joinErr(last, err error) error {
 // its pool to the file's DC and resolves its own file location, so the first
 // bytes don't wait on handshakes and the whole fleet is ready to stripe.
 func (s *Scheduler) Prewarm(meta *resolver.FileMeta) {
+	s.startWarm(meta, false)
+}
+
+// startWarm launches the warm-ups and returns how many it started. Unless
+// forced, a file warmed within prewarmCooldown is skipped.
+func (s *Scheduler) startWarm(meta *resolver.FileMeta, force bool) int {
 	warmer, ok := s.source.(Warmer)
 	if !ok {
-		return
+		return 0
+	}
+
+	var targets []*gotgtg.Worker
+	for _, w := range s.workers {
+		if w.IsHealthy() {
+			targets = append(targets, w)
+		}
 	}
 
 	s.warmMu.Lock()
-	if t, ok := s.warmedAt[meta.DocID]; ok && time.Since(t) < prewarmCooldown {
+	if t, ok := s.warmedAt[meta.DocID]; ok && !force && time.Since(t) < prewarmCooldown {
 		s.warmMu.Unlock()
-		return
+		return 0
 	}
 	if len(s.warmedAt) > 4096 {
 		s.warmedAt = make(map[int64]time.Time)
 	}
 	s.warmedAt[meta.DocID] = time.Now()
+	if s.warming[meta.DC] == 0 {
+		delete(s.warmErr, meta.DC) // a new round: forget the last one's failure
+	}
+	s.warming[meta.DC] += len(targets)
 	s.warmMu.Unlock()
 
 	m := *meta
-	for _, w := range s.workers {
-		if !w.IsHealthy() {
-			continue
-		}
+	for _, w := range targets {
 		go func(w *gotgtg.Worker) {
-			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-			defer cancel()
-			if err := warmer.Warm(ctx, w, &m); err != nil {
+			// Pools are created one per core, so the last of a large fleet
+			// waits a while for its turn on a small VPS.
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+			err := warmer.Warm(ctx, w, &m)
+			cancel()
+
+			s.warmMu.Lock()
+			s.warming[m.DC]--
+			if err != nil {
+				s.warmErr[m.DC] = err
+			}
+			s.warmMu.Unlock()
+			if err != nil {
 				s.log.Debug("prewarm failed", zap.String("worker", w.ID()), zap.Int("dc", m.DC), zap.Error(err))
 			}
 		}(w)
+	}
+	return len(targets)
+}
+
+// waitWarm blocks until a healthy bot this stream may use has a pool for the
+// file's DC, starting a warm-up round if none is running. It returns an error
+// only when a whole round finished without producing a pool.
+func (s *Scheduler) waitWarm(ctx context.Context, meta *resolver.FileMeta, stripe int) error {
+	dc := meta.DC
+	tick := time.NewTicker(warmPoll)
+	defer tick.Stop()
+
+	started := false
+	for {
+		for i, w := range s.workers {
+			if s.allowed(i, stripe) && w.IsHealthy() && s.poolReady(w, dc) {
+				return nil
+			}
+		}
+
+		s.warmMu.Lock()
+		running, lastErr := s.warming[dc], s.warmErr[dc]
+		s.warmMu.Unlock()
+		if running == 0 {
+			if started {
+				if lastErr == nil {
+					lastErr = ErrAllWorkersExhausted
+				}
+				return fmt.Errorf("no bot could open a pool for DC %d: %w", dc, lastErr)
+			}
+			started = true
+			if s.startWarm(meta, true) == 0 {
+				// Nobody healthy to warm right now (all cooling down): go back
+				// to the slot queue, which waits for a bot to return.
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-tick.C:
+					return nil
+				}
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-tick.C:
+		}
 	}
 }
 
@@ -651,7 +750,7 @@ func (v *view) dc(s *Scheduler, dc int) *dcView {
 	dv := &dcView{id: dc, warm: make([]bool, n), limit: make([]int, n)}
 	for i, w := range s.workers {
 		if v.healthy[i] {
-			dv.warm[i] = w.PoolReady(dc)
+			dv.warm[i] = s.poolReady(w, dc)
 			dv.limit[i] = w.SlotLimit(dc)
 		}
 	}

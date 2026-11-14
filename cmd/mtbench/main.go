@@ -43,6 +43,7 @@ func main() {
 	authTimeout := flag.Duration("auth-timeout", 5*time.Minute, "how long to wait for all bots to log in (first login on a small VPS is slow)")
 	verbose := flag.Bool("v", false, "log Telegram connection/auth details to stderr")
 	debug := flag.Bool("vv", false, "like -v, at debug level (very noisy)")
+	warmAll := flag.Bool("warm-all", false, "open every bot's pool on every DC (what PREWARM_DCS does at server start), report the time, and exit")
 	cpuProfile := flag.String("cpuprofile", "", "write a CPU profile of phases 1+2 (after login/warm-up) to this file")
 	memProfile := flag.String("memprofile", "", "write an allocation profile to this file at the end")
 	flag.Parse()
@@ -57,7 +58,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "no bot tokens configured")
 		os.Exit(1)
 	}
-	if *msgID <= 0 {
+	if *msgID <= 0 && !*warmAll {
 		fmt.Printf("usage: mtbench -msg <msg_id> [-conns 1,2,4,8] [-nbots 1,5,20] [-chunks 64] [-windows 16,32,64] [-auth-timeout 5m] [-v] [-cpuprofile f] [-memprofile f]\n")
 		fmt.Printf("configured bots: %d, log channel: %d\n", len(tokens), cfg.LogChannelID)
 		os.Exit(0)
@@ -98,6 +99,18 @@ func main() {
 	}
 	fmt.Printf("  %d/%d bots usable\n", len(workers), len(tokens))
 
+	if *warmAll {
+		fmt.Printf("\nwarming every bot on every DC...\n")
+		res := gotgtg.WarmAllDCs(ctx, workers, func(saved, fresh int) {
+			fmt.Printf("  %d pool(s) reconnect with a saved key, %d need a new auth key\n", saved, fresh)
+		})
+		fmt.Printf("  %d pool(s) open, %d failed, took %v\n", res.Pools, res.Failed, res.Took.Round(time.Millisecond))
+		if res.FirstErr != nil {
+			fmt.Printf("  first error: %v\n", res.FirstErr)
+		}
+		return
+	}
+
 	// 2. Resolve the file through the first usable bot
 	fmt.Printf("\n[2/4] resolving message #%d...\n", *msgID)
 	meta, err := resolve(ctx, workers[0], cfg.LogChannelID, *msgID)
@@ -117,32 +130,13 @@ func main() {
 
 	// 3. Pool check
 	fmt.Printf("\n[3/4] opening a pool on DC %d with the first bot...\n", meta.DC)
-	mediaDCs := map[int]bool{}
-	for _, o := range workers[0].Client().Config().DCOptions {
-		if o.MediaOnly && !o.CDN && !o.Ipv6 {
-			mediaDCs[o.ID] = true
-		}
-	}
-	var md []string
-	for dc := 1; dc <= 5; dc++ {
-		if mediaDCs[dc] {
-			md = append(md, strconv.Itoa(dc))
-		}
-	}
-	if len(md) == 0 {
-		md = []string{"none"}
-	}
-	fmt.Printf("  DCs with a media-only IPv4 address: %s\n", strings.Join(md, ","))
 	t0 := time.Now()
 	pool, err := workers[0].GetPool(ctx, meta.DC)
 	if err != nil {
 		fmt.Printf("  FAILED: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("  ok in %v | media-only=%v | slots=%d\n", time.Since(t0).Round(time.Millisecond), pool.IsMedia, pool.Slots)
-	if !pool.IsMedia {
-		fmt.Println("  warning: fell back to a regular DC pool; connections are capped at 2 and AUTH_KEY_DUPLICATED is possible")
-	}
+	fmt.Printf("  ok in %v | %d connection(s) per bot\n", time.Since(t0).Round(time.Millisecond), pool.Slots)
 
 	// Every bot resolves its own file reference (they are per-account).
 	src := fetch.NewTelegramChunkSource(cfg.LogChannelID)
@@ -153,7 +147,7 @@ func main() {
 	if len(botCounts) == 0 {
 		botCounts = uniq([]int{1, (len(workers) + 1) / 2, len(workers)})
 	}
-	fmt.Printf("  warming %d bots (own file reference + media pool each)...\n", len(workers))
+	fmt.Printf("  warming %d bots (own file reference + DC pool each)...\n", len(workers))
 	var (
 		wg       sync.WaitGroup
 		warmMu   sync.Mutex

@@ -4,23 +4,40 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/gotd/log/logzap"
+	"github.com/gotd/td/session"
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/tg"
+	"github.com/gotd/td/tgerr"
 	"go.uber.org/zap"
 	"golang.org/x/sync/semaphore"
 	"golang.org/x/sync/singleflight"
 )
 
-// Global semaphore to throttle concurrent pool creations (key generation +
+// poolCreationSem limits concurrent pool creations (auth-key generation +
 // auth.exportAuthorization) on cold start. Key generation is CPU-bound (gotd
-// re-verifies the DH prime every time), so on a 1-2 core VPS running 4 at once
-// only makes all of them finish late; 2 at a time gets the first pool for a
-// new DC ready sooner. Capped at 4 to keep auth exports gentle on Telegram.
-var poolCreationSem = semaphore.NewWeighted(int64(min(4, max(2, runtime.NumCPU()))))
+// re-verifies the DH prime every time, ~2.7 s on an Ampere A1 core), so
+// running more at once than there are cores only makes every one of them
+// finish late: on a 1-core VPS two in parallel deliver the first pool for a
+// new DC after ~5.4 s, one at a time delivers it after ~2.7 s. Capped at 4 to
+// keep auth exports gentle on Telegram.
+var poolCreationSem = semaphore.NewWeighted(int64(min(4, max(1, runtime.NumCPU()))))
+
+// poolRestoreSem limits pool creations that need no key generation (a saved
+// session, or the home DC). They only wait on the network.
+var poolRestoreSem = semaphore.NewWeighted(16)
+
+// demandWaiting counts pool creations a download is waiting for. Background
+// warm-up (PREWARM_DCS) stands aside while it is non-zero, so a download for
+// a DC that isn't warm yet doesn't queue behind dozens of background keys.
+var demandWaiting atomic.Int32
 
 const poolCreateTimeout = 45 * time.Second
 
@@ -28,38 +45,50 @@ const poolCreateTimeout = 45 * time.Second
 // itself bounded by poolCreateTimeout, so the queue always drains.
 const poolQueueTimeout = 5 * time.Minute
 
-// mediaAttemptTimeout bounds the media-only attempt so the regular-pool
-// fallback always has time left.
-const mediaAttemptTimeout = 15 * time.Second
-
-// hasMediaAddr reports whether Telegram's config lists a dialable (IPv4,
-// non-CDN) media-only address for dc. Without one, gotd's MediaOnly pool never
-// fails: it redials in a tight loop until the context expires (observed for
-// DC 1 and DC 5), which used to burn the whole pool deadline and skip the
-// fallback, so files outside the bots' home DC could not be served at all.
-func hasMediaAddr(opts []tg.DCOption, dc int) bool {
-	for _, o := range opts {
-		if o.ID == dc && o.MediaOnly && !o.CDN && !o.Ipv6 {
-			return true
-		}
-	}
-	return false
-}
+// MaxPoolConns caps connections per (bot, DC) pool. These are regular
+// connections sharing one auth key, where Telegram answers too many parallel
+// sessions with AUTH_KEY_DUPLICATED.
+//
+// Media-only pools (telegram.Client.MediaOnly), which would allow more, are
+// not used: gotd v0.163.0 cannot open them. Key exchange with a media-only
+// address must send a negated DC id; gotd sends the plain id, Telegram
+// answers "wrong DC" (transport error -444), and gotd redials in a loop until
+// the context expires. Verified live against DC 4: every attempt failed and
+// cost each bot 15 s before it fell back to a regular pool.
+const MaxPoolConns = 2
 
 // DCPool holds a pool of connections for a specific worker on a specific DC.
 type DCPool struct {
 	DC      int
 	Invoker telegram.CloseInvoker
-	IsMedia bool
 	Slots   int
+	// Restored reports that the pool reused a saved auth key (or the home
+	// session) instead of generating a new one.
+	Restored bool
+
+	// Set for pools backed by their own saved session (see dcSession).
+	stop    context.CancelFunc
+	discard atomic.Bool // delete the saved session once the client has stopped
 }
 
 // Close closes the pool's connections.
 func (p *DCPool) Close() error {
+	var err error
 	if p.Invoker != nil {
-		return p.Invoker.Close()
+		err = p.Invoker.Close()
 	}
-	return nil
+	if p.stop != nil {
+		p.stop()
+	}
+	return err
+}
+
+// dcSessions tells a PoolManager where to keep one saved session per foreign
+// DC, and the credentials to open them with.
+type dcSessions struct {
+	appID   int
+	appHash string
+	dir     string
 }
 
 // PoolManager lazily creates and manages DC connection pools for a worker.
@@ -68,6 +97,7 @@ type PoolManager struct {
 	workerID string
 	client   *telegram.Client
 	mConns   int
+	saved    *dcSessions // nil: foreign-DC keys live in memory only
 
 	mu    sync.RWMutex
 	pools map[int]*DCPool
@@ -96,26 +126,48 @@ func (pm *PoolManager) Ready(dc int) bool {
 	return ok
 }
 
-// SlotsFor returns how many concurrent RPCs the pool for dc supports. Before
-// the pool exists it reports the configured media-pool size.
+// SlotsFor returns how many concurrent RPCs the pool for dc supports.
 func (pm *PoolManager) SlotsFor(dc int) int {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
 	if p, ok := pm.pools[dc]; ok && p.Slots > 0 {
 		return p.Slots
 	}
-	return pm.mConns
+	return min(pm.mConns, MaxPoolConns)
 }
 
 // GetPool gets or lazily creates a pool for the target DC. Creation runs on a
 // detached context so one caller cancelling doesn't fail everybody waiting.
 func (pm *PoolManager) GetPool(ctx context.Context, dc int) (*DCPool, error) {
+	return pm.getPool(ctx, dc, false)
+}
+
+// GetPoolBackground is GetPool for warm-up nobody is waiting on: it lets pool
+// creations that a download needs go first.
+func (pm *PoolManager) GetPoolBackground(ctx context.Context, dc int) (*DCPool, error) {
+	return pm.getPool(ctx, dc, true)
+}
+
+func (pm *PoolManager) getPool(ctx context.Context, dc int, background bool) (*DCPool, error) {
 	pm.mu.RLock()
 	if pool, ok := pm.pools[dc]; ok {
 		pm.mu.RUnlock()
 		return pool, nil
 	}
 	pm.mu.RUnlock()
+
+	if background {
+		for demandWaiting.Load() > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(100 * time.Millisecond):
+			}
+		}
+	} else {
+		demandWaiting.Add(1)
+		defer demandWaiting.Add(-1)
+	}
 
 	key := fmt.Sprintf("%s:%d", pm.workerID, dc)
 	ch := pm.sf.DoChan(key, func() (interface{}, error) {
@@ -126,16 +178,22 @@ func (pm *PoolManager) GetPool(ctx context.Context, dc int) (*DCPool, error) {
 		}
 		pm.mu.RUnlock()
 
+		// Only key generation is CPU-bound and has to queue for a core; a
+		// saved key or the home session just needs a connection.
+		sem := poolCreationSem
+		if dc == pm.homeDC() || pm.hasSavedSession(dc) {
+			sem = poolRestoreSem
+		}
+
 		// Waiting for a creation slot must not eat the creation deadline: on a
-		// 1-core VPS one auth key costs ~2.7 s of CPU, so warming 20 bots two
-		// at a time takes over a minute and the last ones used to time out in
-		// the queue, then generate their keys mid-download instead.
+		// 1-core VPS one auth key costs ~2.7 s of CPU, so the last of 20 bots
+		// waits about a minute for its turn.
 		qctx, qcancel := context.WithTimeout(context.Background(), poolQueueTimeout)
 		defer qcancel()
-		if err := poolCreationSem.Acquire(qctx, 1); err != nil {
+		if err := sem.Acquire(qctx, 1); err != nil {
 			return nil, fmt.Errorf("waiting for a pool creation slot: %w", err)
 		}
-		defer poolCreationSem.Release(1)
+		defer sem.Release(1)
 
 		cctx, cancel := context.WithTimeout(context.Background(), poolCreateTimeout)
 		defer cancel()
@@ -147,7 +205,11 @@ func (pm *PoolManager) GetPool(ctx context.Context, dc int) (*DCPool, error) {
 		pm.mu.Lock()
 		pm.pools[dc] = pool
 		pm.mu.Unlock()
-		pm.log.Info("dc pool opened", zap.Int("dc", dc), zap.Bool("media_only", pool.IsMedia), zap.Int("slots", pool.Slots))
+		if pool.Restored {
+			pm.log.Debug("dc pool opened", zap.Int("dc", dc), zap.Int("slots", pool.Slots))
+		} else {
+			pm.log.Info("dc pool opened with a new auth key", zap.Int("dc", dc), zap.Int("slots", pool.Slots))
+		}
 		return pool, nil
 	})
 
@@ -167,57 +229,177 @@ func (pm *PoolManager) homeDC() int {
 }
 
 func (pm *PoolManager) createPool(ctx context.Context, dc int) (*DCPool, error) {
-	// Non-media connections risk AUTH_KEY_DUPLICATED, so keep them small.
-	fallbackConns := pm.mConns
-	if fallbackConns > 2 {
-		fallbackConns = 2
-	}
-
-	var errs []error
-
-	// 1. Media-only pool: always safe to open in parallel, but only if
-	// Telegram actually advertises a media address for this DC.
-	var (
-		invoker telegram.CloseInvoker
-		err     error
-	)
-	if hasMediaAddr(pm.client.Config().DCOptions, dc) {
-		mctx, mcancel := context.WithTimeout(ctx, mediaAttemptTimeout)
-		invoker, err = pm.client.MediaOnly(mctx, dc, int64(pm.mConns))
-		mcancel()
-		if err == nil && invoker != nil {
-			return &DCPool{DC: dc, Invoker: invoker, IsMedia: true, Slots: pm.mConns}, nil
-		}
-		errs = append(errs, fmt.Errorf("media-only: %w", err))
-		pm.log.Debug("media-only pool unavailable, falling back", zap.Int("dc", dc), zap.Error(err))
-	} else {
-		pm.log.Debug("no media-only address for dc, using a regular pool", zap.Int("dc", dc))
-	}
-	if ctx.Err() != nil {
-		return nil, errors.Join(errs...)
-	}
+	conns := min(pm.mConns, MaxPoolConns)
 
 	if dc == pm.homeDC() {
 		// Home DC shares the primary session; auth export to ourselves is invalid.
-		invoker, err = pm.client.Pool(int64(fallbackConns))
-		if err == nil && invoker != nil {
-			return &DCPool{DC: dc, Invoker: invoker, IsMedia: false, Slots: fallbackConns}, nil
+		invoker, err := pm.client.Pool(int64(conns))
+		if err != nil || invoker == nil {
+			return nil, fmt.Errorf("failed to create pool for DC %d: %w", dc, err)
 		}
-		errs = append(errs, fmt.Errorf("home pool: %w", err))
-		return nil, fmt.Errorf("failed to create pool for DC %d: %w", dc, errors.Join(errs...))
+		return &DCPool{DC: dc, Invoker: invoker, Slots: conns, Restored: true}, nil
 	}
 
-	// 2. Regular foreign-DC pool.
-	invoker, err = pm.client.DC(ctx, dc, int64(fallbackConns))
-	if err == nil && invoker != nil {
-		return &DCPool{DC: dc, Invoker: invoker, IsMedia: false, Slots: fallbackConns}, nil
+	if pm.saved != nil {
+		pool, err := pm.createSavedPool(ctx, dc, conns)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create pool for DC %d: %w", dc, err)
+		}
+		return pool, nil
 	}
-	errs = append(errs, fmt.Errorf("dc pool: %w", err))
 
-	return nil, fmt.Errorf("failed to create pool for DC %d: %w", dc, errors.Join(errs...))
+	invoker, err := pm.client.DC(ctx, dc, int64(conns))
+	if err != nil || invoker == nil {
+		return nil, fmt.Errorf("failed to create pool for DC %d: %w", dc, err)
+	}
+	return &DCPool{DC: dc, Invoker: invoker, Slots: conns}, nil
 }
 
-// InvalidatePool tears down and removes a broken pool (e.g. after AUTH_KEY error).
+func (pm *PoolManager) sessionPath(dc int) string {
+	return filepath.Join(pm.saved.dir, fmt.Sprintf("bot_%s_dc%d.json", pm.workerID, dc))
+}
+
+// hasSavedSession reports whether a key for dc is already on disk.
+func (pm *PoolManager) hasSavedSession(dc int) bool {
+	if pm.saved == nil {
+		return false
+	}
+	fi, err := os.Stat(pm.sessionPath(dc))
+	return err == nil && fi.Size() > 0
+}
+
+// createSavedPool opens the pool for a foreign DC through a second gotd
+// client whose own session file holds this bot's auth key for that DC.
+//
+// telegram.Client.DC keeps foreign-DC keys in memory only, so every restart
+// regenerated one key per bot per DC (~2.7 s of CPU each on an Ampere A1
+// core, ~50 s for 20 bots before a DC was fully usable). gotd does persist a
+// client's primary session, so each (bot, DC) gets a client that treats that
+// DC as its primary: the first run generates the key and copies the bot's
+// authorization over (auth.exportAuthorization on the home DC,
+// auth.importAuthorization here, as the official clients do), later runs
+// just reconnect with the saved key.
+func (pm *PoolManager) createSavedPool(ctx context.Context, dc, conns int) (*DCPool, error) {
+	path := pm.sessionPath(dc)
+	restored := pm.hasSavedSession(dc)
+
+	client := telegram.NewClient(pm.saved.appID, pm.saved.appHash, telegram.Options{
+		DC:             dc,
+		Resolver:       CreateResolver(),
+		SessionStorage: &session.FileStorage{Path: path},
+		Logger:         logzap.New(LibraryLogger(pm.log).With(zap.Int("dc_session", dc))),
+		NoUpdates:      true,
+		DialTimeout:    connectTimeout,
+		RetryInterval:  rpcResendInterval,
+	})
+
+	pool := &DCPool{DC: dc, Slots: conns, Restored: restored}
+	runCtx, stop := context.WithCancel(context.Background())
+	pool.stop = stop
+
+	ready := make(chan error, 1)
+	go func() {
+		err := client.Run(runCtx, func(rctx context.Context) error {
+			invoker, err := client.Pool(int64(conns))
+			if err != nil || invoker == nil {
+				return fmt.Errorf("open connections: %w", err)
+			}
+			if err := pm.authorize(rctx, invoker, dc); err != nil {
+				_ = invoker.Close()
+				return err
+			}
+			pool.Invoker = invoker
+			ready <- nil
+			<-rctx.Done()
+			return rctx.Err()
+		})
+		select {
+		case ready <- err: // stopped before it was ever ready
+		default:
+		}
+
+		if pool.discard.Load() {
+			_ = os.Remove(path)
+		}
+		if runCtx.Err() == nil {
+			// The client gave up on its own (not via Close): drop the pool so
+			// the next download or warm-up reopens it.
+			pm.log.Warn("dc session stopped, it will be reopened on next use", zap.Int("dc", dc), zap.Error(err))
+			pm.forget(dc, pool)
+		}
+	}()
+
+	select {
+	case err := <-ready:
+		if err != nil {
+			if restored {
+				// A saved key that no longer works must not be tried forever.
+				pool.discard.Store(true)
+				_ = os.Remove(path)
+			}
+			stop()
+			return nil, err
+		}
+	case <-ctx.Done():
+		stop()
+		return nil, ctx.Err()
+	}
+
+	return pool, nil
+}
+
+// authorize makes sure the key behind invoker is logged in as this bot.
+//
+// invoker must talk to the DC directly (a pool, not client.API()): asked "who
+// am I" on a DC that is not the bot's home, Telegram answers an authorized key
+// with USER_MIGRATE_<home>, and gotd's API wrapper reacts to that by moving
+// the whole client to the home DC, which would turn this DC's saved session
+// into a second home session.
+func (pm *PoolManager) authorize(ctx context.Context, invoker tg.Invoker, dc int) error {
+	direct := tg.NewClient(invoker)
+	_, err := direct.UsersGetUsers(ctx, []tg.InputUserClass{&tg.InputUserSelf{}})
+	if err == nil {
+		return nil
+	}
+	rpcErr, ok := tgerr.As(err)
+	switch {
+	case ok && rpcErr.Type == "USER_MIGRATE":
+		return nil // logged in; this simply isn't the bot's home DC
+	case ok && rpcErr.Code == 401:
+		// Fresh key (or one Telegram no longer knows): copy the login over.
+	default:
+		return fmt.Errorf("auth status: %w", err)
+	}
+
+	exported, err := pm.client.API().AuthExportAuthorization(ctx, dc)
+	if err != nil {
+		return fmt.Errorf("export authorization: %w", err)
+	}
+	if _, err := direct.AuthImportAuthorization(ctx, &tg.AuthImportAuthorizationRequest{
+		ID:    exported.ID,
+		Bytes: exported.Bytes,
+	}); err != nil {
+		return fmt.Errorf("import authorization: %w", err)
+	}
+	return nil
+}
+
+// forget removes pool from the map if it is still the current one for dc.
+func (pm *PoolManager) forget(dc int, pool *DCPool) {
+	pm.mu.Lock()
+	current := pm.pools[dc] == pool
+	if current {
+		delete(pm.pools, dc)
+	}
+	pm.mu.Unlock()
+	if current {
+		_ = pool.Close()
+	}
+}
+
+// InvalidatePool tears down and removes a broken pool (e.g. after AUTH_KEY
+// error). A saved session for that DC is deleted too, so the next use starts
+// from a fresh key instead of reloading the rejected one.
 func (pm *PoolManager) InvalidatePool(dc int) {
 	pm.mu.Lock()
 	pool, ok := pm.pools[dc]
@@ -227,6 +409,9 @@ func (pm *PoolManager) InvalidatePool(dc int) {
 	pm.mu.Unlock()
 
 	if ok && pool != nil {
+		if pool.stop != nil {
+			pool.discard.Store(true)
+		}
 		_ = pool.Close()
 	}
 }
@@ -243,3 +428,5 @@ func (pm *PoolManager) CloseAll() {
 		delete(pm.pools, dc)
 	}
 }
+
+var errNoPoolManager = errors.New("worker has no pool manager")

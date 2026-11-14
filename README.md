@@ -1,6 +1,6 @@
 # mtflux ⚡
 
-**mtflux** is a high-throughput Telegram → direct-link streaming and download server written in Go. It stripes 1 MiB chunks across **N worker bots × M media-DC connections** with a sliding-window reader, so a single download link is served by many connections at once.
+**mtflux** is a high-throughput Telegram → direct-link streaming and download server written in Go. It stripes 1 MiB chunks across **N worker bots × 2 connections each** with a sliding-window reader, so a single download link is served by many connections at once.
 
 ---
 
@@ -9,8 +9,8 @@
 Existing solutions like TG-FileStreamBot top out around ~10 MB/s per bot: one bot per request, one connection per foreign DC, batch-barrier prefetch, no sharing.
 
 - **Chunk-level striping.** Each 1 MiB chunk goes to whichever (bot, DC connection) slot is free. Slots are accounted per (bot, DC): never more than M getFile RPCs in flight per bot, FIFO queue when full.
-- **Media-only DCs where they exist.** Telegram's live config advertises media-only addresses for DC 2 and DC 4 only; there each bot gets M parallel-safe connections. Every other DC (and a bot's home DC) gets a regular pool capped at 2 connections per bot, to stay clear of `AUTH_KEY_DUPLICATED`. Foreign DC requests go straight to the file's DC (no `FILE_MIGRATE` round trip).
-- **Warm pools.** Pools are opened on every bot as soon as a download starts; the scheduler prefers warm pools, so no chunk waits for a handshake once any bot is ready.
+- **Two connections per bot per DC.** Every bot opens a pool of 2 connections to the file's DC (more per bot draws `AUTH_KEY_DUPLICATED`), and requests go straight to that DC (no `FILE_MIGRATE` round trip). Telegram's media-only addresses (DC 2 and DC 4), which would allow more, are not used: gotd v0.163.0 cannot complete a key exchange with them ("wrong DC").
+- **Warm pools, saved keys.** With `PREWARM_DCS=true` (default) every bot connects to every DC in the background at startup. Each bot's auth key for each DC is saved to disk (gotd itself only keeps the home DC's), so only the very first start pays for key generation; after a restart 20 bots × 5 DCs reconnect in seconds. A chunk is never tied to a bot whose pool is still being created: it goes to whichever bot is ready first.
 - **Sliding window with fast slow-start.** No batch barrier. The window doubles every `STREAM_WINDOW_MIN` chunks up to `STREAM_WINDOW_MAX`, and by default scales to *bots × connections* so one link can keep every slot busy.
 - **Failover, not sleeping.** Flood-wait → that bot cools down and the chunk moves to another bot immediately. A getFile slower than `FETCH_ATTEMPT_TIMEOUT` is abandoned at the deadline and retried elsewhere, without waiting for the stalled connection to confirm the cancellation. Bots that keep failing are parked.
 - **Per-bot file references.** Telegram file references are bound to the account that fetched them (verified live: sharing one bot's reference made 13 of 20 bots fail with `FILE_REFERENCE_EXPIRED`). Each bot resolves the log message itself, caches its own location, and only that bot refreshes when Telegram rejects it.
@@ -19,16 +19,16 @@ Existing solutions like TG-FileStreamBot top out around ~10 MB/s per bot: one bo
 - **Shared chunk cache + dedup.** Concurrent viewers, seeks, and IDM/aria2's parallel connections share one fetch. A fetch is cancelled once *every* waiter has gone.
 - **Zero-copy path.** Cached chunk slices are written straight to the socket.
 - **Lean MTProto path.** The obfuscation layer (an extra AES-CTR pass over every byte) is off by default, and AES-IGE decryption uses a register-chained loop on arm64 (+23% on an Ampere A1; vendored in [third_party/ige](third_party/ige)). Download cost on one A1 core: **7.9 ms CPU per MiB** (~127 MB/s per core).
-- **Small-VPS friendly cold start.** Bots without a saved session log in a few at a time, and DC pools are created at most CPU-count at once, so a 1-core box doesn't stall generating 20 auth keys in parallel.
+- **Small-VPS friendly cold start.** Bots without a saved session log in a few at a time, and DC pools are created one per core at a time, so a 1-core box doesn't stall generating 20 auth keys in parallel and the first pool is ready as early as possible.
 
-Measured in-process against a 100 ms-latency fake Telegram with 20 bots × 4 conns (`go test ./internal/stream -run x -bench SingleStream -benchtime 1x`, 128 MiB):
+Measured in-process against a 100 ms-latency fake Telegram with 20 bots × 2 conns (`go test ./internal/stream -run x -bench SingleStream -benchtime 1x`, 128 MiB):
 
 | stream window | single-link throughput |
 |---|---|
 | 4 | 39 MB/s |
-| 16 | 126 MB/s |
-| 32 | 206 MB/s |
-| 64 (auto for 20 bots) | **249 MB/s** (bounded by ramp-up on a 128 MiB file; approaches the 640 MB/s slot ceiling on longer files) |
+| 16 | 114 MB/s |
+| 32 | 156 MB/s |
+| 64 (auto for 20 bots) | **156 MB/s** (bounded by ramp-up on a 128 MiB file; the 40 slots allow 400 MB/s on longer files) |
 
 More simulations (`go test ./internal/fetch -run x -bench . -benchtime 1x`): on a link-limited host the adaptive limiter lifts goodput from 8.5 to 49.75 chunks/s (99.5% of the link) with zero re-downloads, and a second viewer's first byte drops from 2.9 s to 0.33 s.
 
@@ -50,8 +50,8 @@ What this means for deployment:
 - **The file's DC matters, the bots' DC doesn't.** A file lives on its uploader's DC; all 20 DC 5 bots pulled 96 MB/s from DC 1. Put the server near the DC your users upload to (India → DC 5 Singapore, Europe → DC 2/4 Amsterdam, Americas → DC 1/3 Miami).
 - **Per-connection speed is latency-bound.** `upload.getFile` returns at most 1 MiB, so throughput ≈ requests in flight × 1 MiB ÷ round trip.
 - **Each bot is rate-limited to roughly 20 getFile/s** (`FLOOD_WAIT_1` above ~20 MB/s from one bot). mtflux cools that bot down for the stated second and moves its chunks elsewhere; more bots spread the load.
-- **`CONNS_PER_BOT_PER_DC` above 2 only helps for DC 2/4 files.** Elsewhere pools hold 2 connections and extra requests just queue.
-- **First download from a new DC after a restart warms every bot.** Each bot generates an auth key for that DC (~2.7 s of CPU on an A1 core), so warm-up of 20 bots takes ~50 s on 1 OCPU. Downloads start on the first warm bot and speed up as the rest join.
+- **`CONNS_PER_BOT_PER_DC` above 2 has no effect.** Pools hold 2 connections per bot on every DC.
+- **Auth keys are generated once, then saved.** A bot needs one auth key per DC (~2.7 s of CPU on an A1 core). The first start generates them in the background, one per core at a time: 20 bots × 4 other DCs is about 3.5 minutes on 1 OCPU, during which a download from a DC that isn't warm yet starts on the first ready bot and speeds up as the rest join (measured on the A1 with cold pools: 16.9 MB/s for the first DC 1 download, 66.9 MB/s a minute later). Keys live in `DATA_DIR/sessions/bot_<id>_dc<n>.json`; keep that volume and later starts skip all of this.
 
 Run `mtbench` on your own VPS before tuning: if its raw sweep is flat as bots × connections grow, more bots won't help on that host.
 
@@ -84,7 +84,7 @@ HTTP client ─GET /dl/{token}/{name}─▶ httpapi ─▶ resolver ─(FileMeta
                      scheduler: warm (bot, dc) with a free slot, lowest load, lowest latency
                                         │
              ┌──────────────┬───────────┴──────┬──────────────┐
-          bot1: MediaOnly(dc,M)  bot2: MediaOnly(dc,M)  …  botN   (each conn = 1 in-flight getFile)
+          bot1: pool(dc, 2)      bot2: pool(dc, 2)      …  botN   (each conn = 1 in-flight getFile)
 ```
 
 ---
@@ -154,12 +154,13 @@ Everything is configured by environment (see [.env.sample](.env.sample)). The st
 
 | Setting | Default | Notes |
 |---|---|---|
-| `SPEED_PROFILE` | `fast` | `safe` (2 conns), `fast` (4), `extreme` (8; highest flood risk) |
-| `CONNS_PER_BOT_PER_DC` | profile | Parallel getFile RPCs per bot per DC (**M**). Only media-only DCs (2, 4) use more than 2 |
+| `SPEED_PROFILE` | `fast` | Sets the default stream window: `safe` (4), `fast` (16), `extreme` (32) |
+| `CONNS_PER_BOT_PER_DC` | profile | Parallel getFile RPCs per bot per DC (**M**), capped at 2 |
 | `STREAM_WINDOW_MAX` | auto | Auto = bots × M, between the profile default and 64 |
 | `STREAM_WINDOW_MIN` | auto | Initial window; auto = max/8 clamped to 4–8 |
 | `STREAM_MAX_BOTS` | `0` (all) | Per-download cap on distinct bots; rotates across downloads |
 | `FETCH_ATTEMPT_TIMEOUT` | `10s` | A slower getFile is retried on another bot (stretched automatically on slow links) |
+| `PREWARM_DCS` | `true` | Connect every bot to every DC at startup (background). `false`: a DC is warmed by its first download |
 | `MTPROTO_OBFUSCATION` | `false` | Obfuscated2 transport; enable only where Telegram is blocked (costs ~9% CPU) |
 | `MAX_BUFFER_MB` | `1024` | Read-ahead budget across all downloads |
 | `CHUNK_CACHE_MB` | `256` | Shared cache for seeks / parallel downloaders |
@@ -175,7 +176,7 @@ At `LOG_LEVEL=info` every download ends with one summary line, which is the firs
 
 `outcome` is `complete`, `client_gone` (the client disconnected or stalled) or `upstream_failed` (Telegram could not deliver a chunk; the connection is aborted). `chunk attempt failed, retrying on another bot` lines are routine in small numbers: a slow or failed `getFile` is moved to another bot. A `chunk failed` error means every attempt was used up.
 
-Total in-flight RPCs are additionally capped by the adaptive limiter, so the settings above are ceilings, not targets. Go's heap is soft-limited to `MAX_BUFFER_MB + CHUNK_CACHE_MB + 512` MiB (unless you set `GOMEMLIMIT`). **Rule of thumb for the window:** it should be ≥ bots × M, otherwise slots sit idle. **Rule of thumb for M:** total slots = bots × M; once that exceeds what your VPS link can carry, extra connections only add flood-wait risk. 20 bots × 4 = 80 slots is already past 1 Gbit at typical per-connection speeds.
+Total in-flight RPCs are additionally capped by the adaptive limiter, so the settings above are ceilings, not targets. Go's heap is soft-limited to `MAX_BUFFER_MB + CHUNK_CACHE_MB + 512` MiB (unless you set `GOMEMLIMIT`). **Rule of thumb for the window:** it should be ≥ bots × 2, otherwise slots sit idle. Total slots = bots × 2; more bots add slots and spread the per-bot rate limit.
 
 ### Benchmark with your own bots (`mtbench`)
 
@@ -191,7 +192,7 @@ docker run --rm --env-file .env -v mtflux_bench:/data mtflux-bench \
 What it reports:
 
 1. **Login**: per bot, its home DC and login time, or the exact error.
-2. **The file**: its DC, which DCs offer media-only addresses, and the pool type and slot count the first bot gets.
+2. **The file**: its DC, and how long the first bot takes to open a pool there.
 3. **Warm-up**: how long it took for every bot to open a pool on the file's DC, and any bot that failed.
 4. **Phase 1**: raw `upload.getFile` throughput over *bots × connections*, with p50/p90 per chunk and the full first error of any failing bot.
 5. **Phase 2**: one download through the real scheduler and window, i.e. what a single link gets.
@@ -204,6 +205,7 @@ What it reports:
 | `-chunks` | `64` | MiB per run (use the whole file for steady-state numbers) |
 | `-windows` | `16,32,64` | Phase 2 windows; `""` skips phase 2 |
 | `-auth-timeout` | `5m` | Wait for logins (a first login on a small VPS is slow) |
+| `-warm-all` | off | Open every bot's pool on every DC, as `PREWARM_DCS` does at server start, print how long it took, and exit (no `-msg` needed) |
 | `-v` / `-vv` | off | Telegram connection logs at info / debug level |
 | `-cpuprofile`, `-memprofile` | off | pprof files for phases 1+2 (mount a writable dir, e.g. `-v ~/prof:/prof`, then `go tool pprof -top prof/cpu.pprof`) |
 

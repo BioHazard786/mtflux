@@ -67,6 +67,12 @@ type Config struct {
 	// Telegram is blocked or inspected; elsewhere it costs ~9% of download CPU.
 	MTProtoObfuscation bool `env:"MTPROTO_OBFUSCATION" envDefault:"false"`
 
+	// PrewarmDCs opens every bot's connections to every Telegram DC in the
+	// background at startup, so the first download from a DC doesn't wait for
+	// them. The first start generates one auth key per bot per DC (CPU-heavy);
+	// the keys are saved, so later starts only reconnect.
+	PrewarmDCs bool `env:"PREWARM_DCS" envDefault:"true"`
+
 	// FetchAttemptTimeout bounds a single upload.getFile RPC before the chunk is retried on another bot.
 	FetchAttemptTimeout time.Duration `env:"FETCH_ATTEMPT_TIMEOUT" envDefault:"10s"`
 

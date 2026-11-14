@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -149,6 +150,7 @@ func NewWorker(appID int, appHash, token, dataDir string, mConns int, log *zap.L
 	client := telegram.NewClient(appID, appHash, opts)
 	poolManager := NewPoolManager(botID, client, mConns)
 	poolManager.log = workerLog
+	poolManager.saved = &dcSessions{appID: appID, appHash: appHash, dir: sessionsDir}
 
 	return &Worker{
 		id:          botID,
@@ -349,6 +351,42 @@ func ParseChannelID(id int64) int64 {
 // GetPool returns a connection pool for the specified DC.
 func (w *Worker) GetPool(ctx context.Context, dc int) (*DCPool, error) {
 	return w.poolManager.GetPool(ctx, dc)
+}
+
+// WarmPool opens the pool for dc ahead of any download, giving way to pool
+// creations that a download is waiting for.
+func (w *Worker) WarmPool(ctx context.Context, dc int) error {
+	if w.poolManager == nil {
+		return errNoPoolManager
+	}
+	_, err := w.poolManager.GetPoolBackground(ctx, dc)
+	return err
+}
+
+// PoolNeedsKey reports whether opening the pool for dc has to generate a new
+// auth key (seconds of CPU), as opposed to reconnecting with a saved one.
+func (w *Worker) PoolNeedsKey(dc int) bool {
+	pm := w.poolManager
+	if pm == nil || pm.Ready(dc) || dc == pm.homeDC() {
+		return false
+	}
+	return !pm.hasSavedSession(dc)
+}
+
+// KnownDCs lists the regular (non-CDN) datacenters from Telegram's config, in
+// ascending order.
+func (w *Worker) KnownDCs() []int {
+	seen := map[int]bool{}
+	var dcs []int
+	for _, o := range w.client.Config().DCOptions {
+		if o.CDN || o.ID <= 0 || seen[o.ID] {
+			continue
+		}
+		seen[o.ID] = true
+		dcs = append(dcs, o.ID)
+	}
+	sort.Ints(dcs)
+	return dcs
 }
 
 // PoolReady reports whether the pool for dc already exists.

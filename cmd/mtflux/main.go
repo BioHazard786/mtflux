@@ -169,12 +169,21 @@ func main() {
 		debug.SetMemoryLimit(cfg.MemoryLimitBytes())
 	}
 
+	// Pools never hold more than MaxPoolConns connections per bot, whatever
+	// the profile asks for; report what is really in effect.
+	conns := min(cfg.ConnsPerBotPerDC, gotgtg.MaxPoolConns)
+	if cfg.ConnsPerBotPerDC > conns {
+		logger.Warn("config", zap.String("warning", fmt.Sprintf(
+			"CONNS_PER_BOT_PER_DC=%d is capped at %d: Telegram rejects more parallel connections per bot and DC",
+			cfg.ConnsPerBotPerDC, conns)))
+	}
 	logger.Info("configuration loaded",
 		zap.String("profile", string(cfg.SpeedProfile)),
 		zap.Int("workers", len(tokens)),
-		zap.Int("conns_per_bot_dc", cfg.ConnsPerBotPerDC),
-		zap.Int("slots_per_dc", len(tokens)*cfg.ConnsPerBotPerDC),
+		zap.Int("conns_per_bot_dc", conns),
+		zap.Int("slots_per_dc", len(tokens)*conns),
 		zap.Bool("mtproto_obfuscation", cfg.MTProtoObfuscation),
+		zap.Bool("prewarm_dcs", cfg.PrewarmDCs),
 		zap.Int("stream_window_min", cfg.StreamWindowMin),
 		zap.Int("stream_window_max", cfg.StreamWindowMax),
 		zap.Int("stream_max_bots", cfg.StreamMaxBots),
@@ -264,6 +273,9 @@ wait:
 	budget := stream.NewGlobalBudget(cfg.MaxBufferMB)
 
 	go publishWorkerStats(ctx, workers, m)
+	if cfg.PrewarmDCs {
+		go prewarmDCs(ctx, workers, logger)
+	}
 
 	// 5. Main bot
 	mainBot, err := bot.NewBot(cfg, accessMgr, res, sched, m, logger)
@@ -358,6 +370,26 @@ wait:
 		w.Close()
 	}
 	logger.Info("mtflux cleanly stopped")
+}
+
+// prewarmDCs warms every bot on every DC in the background and logs the outcome.
+func prewarmDCs(ctx context.Context, workers []*gotgtg.Worker, log *zap.Logger) {
+	res := gotgtg.WarmAllDCs(ctx, workers, func(saved, fresh int) {
+		log.Info("warming all DCs in the background", zap.Int("saved_keys", saved), zap.Int("new_keys", fresh))
+	})
+	if ctx.Err() != nil || res.Pools+res.Failed == 0 {
+		return
+	}
+	fields := []zap.Field{
+		zap.Int("pools", res.Pools),
+		zap.Int("failed", res.Failed),
+		zap.Duration("took", res.Took.Round(time.Millisecond)),
+	}
+	if res.FirstErr != nil {
+		log.Warn("all DCs warmed, with failures (those pools open on first use)", append(fields, zap.NamedError("first_error", res.FirstErr))...)
+		return
+	}
+	log.Info("all DCs warmed", fields...)
 }
 
 // publishWorkerStats mirrors worker state into the metrics registry that
