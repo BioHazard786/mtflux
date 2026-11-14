@@ -111,7 +111,7 @@ func NewBot(
 	b.client = telegram.NewClient(cfg.AppID, cfg.AppHash, telegram.Options{
 		Resolver:       gotgtg.CreateResolver(),
 		SessionStorage: sessionStorage,
-		Logger:         logzap.New(botLog),
+		Logger:         logzap.New(gotgtg.LibraryLogger(log).With(zap.String("role", "main_bot"))),
 		UpdateHandler:  dispatcher,
 		Middlewares:    []telegram.Middleware{b.waiter},
 	})

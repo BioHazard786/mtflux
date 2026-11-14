@@ -318,3 +318,61 @@ func TestScheduler_UrgentChunksJumpTheQueue(t *testing.T) {
 		t.Fatalf("the urgent chunk should be served right after the slot frees, got order %v", order)
 	}
 }
+
+// A getFile that outlives its deadline must not hold the chunk hostage: gotd
+// keeps a cancelled call open while it waits for rpc_drop_answer on the same
+// (possibly stalled) connection. The chunk has to move to another bot at the
+// deadline, while the stalled bot's slot stays occupied until the call returns.
+func TestScheduler_TimedOutAttemptIsAbandonedButKeepsItsSlot(t *testing.T) {
+	ws := newWorkers(t, 2, 1)
+	s := NewScheduler(ws, 1<<20, 0, 0, nil, nil, zap.NewNop())
+	s.SetTimeouts(100*time.Millisecond, 10*time.Second)
+
+	const linger = 700 * time.Millisecond
+	var (
+		calls    atomic.Int32
+		stalled  atomic.Pointer[gotgtg.Worker]
+		returned = make(chan struct{})
+	)
+	s.SetSource(funcSource(func(ctx context.Context, w *gotgtg.Worker, idx int) ([]byte, error) {
+		if calls.Add(1) == 1 {
+			stalled.Store(w)
+			<-ctx.Done()
+			time.Sleep(linger) // the client library still winding the request down
+			close(returned)
+			return nil, ctx.Err()
+		}
+		if w == stalled.Load() {
+			t.Errorf("a new request was sent to the bot whose connection is still busy")
+		}
+		return []byte("ok"), nil
+	}))
+
+	start := time.Now()
+	data, err := s.FetchChunk(context.Background(), &resolver.FileMeta{DocID: 1, DC: 4}, 0)
+	took := time.Since(start)
+	if err != nil || string(data) != "ok" {
+		t.Fatalf("FetchChunk = %q, %v", data, err)
+	}
+	if took >= linger {
+		t.Fatalf("chunk took %v: it waited for the abandoned call instead of moving on at the deadline", took)
+	}
+
+	w := stalled.Load()
+	if got := w.Inflight(); got != 1 {
+		t.Fatalf("stalled worker inflight = %d while its call is still open, want 1", got)
+	}
+	// A second chunk must also avoid the busy bot.
+	if _, err := s.FetchChunk(context.Background(), &resolver.FileMeta{DocID: 1, DC: 4}, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	<-returned
+	deadline := time.Now().Add(2 * time.Second)
+	for w.Inflight() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("slot never released after the abandoned call returned (inflight %d)", w.Inflight())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/biohazard786/mtflux/internal/logging"
 	"github.com/caarlos0/env/v11"
 	"github.com/joho/godotenv"
 )
@@ -93,6 +94,13 @@ type Config struct {
 	// is set; otherwise set METRICS_ADDR to expose it on a separate (internal) listener.
 	MetricsAuthToken string `env:"METRICS_AUTH_TOKEN" envDefault:""`
 	MetricsAddr      string `env:"METRICS_ADDR" envDefault:""`
+
+	// Logging. LogLevel covers mtflux's own messages; TGLogLevel covers the
+	// Telegram client library, which is very chatty at info (several lines
+	// per connection). Both take debug|info|warn|error.
+	LogLevel   string `env:"LOG_LEVEL" envDefault:"info"`
+	TGLogLevel string `env:"TG_LOG_LEVEL" envDefault:"warn"`
+	LogFormat  string `env:"LOG_FORMAT" envDefault:"console"` // console | json
 
 	windowMaxAuto bool
 	windowMinAuto bool
@@ -208,6 +216,16 @@ func (c *Config) validate() error {
 		return fmt.Errorf("FETCH_ATTEMPT_TIMEOUT %v is too short (minimum 1s)", c.FetchAttemptTimeout)
 	}
 
+	if _, err := logging.ParseLevel(c.LogLevel); err != nil {
+		return fmt.Errorf("LOG_LEVEL: %w", err)
+	}
+	if _, err := logging.ParseLevel(c.TGLogLevel); err != nil {
+		return fmt.Errorf("TG_LOG_LEVEL: %w", err)
+	}
+	if !logging.ValidFormat(c.LogFormat) {
+		return fmt.Errorf("LOG_FORMAT %q must be \"console\" or \"json\"", c.LogFormat)
+	}
+
 	ttl, err := ParseTTL(c.DefaultLinkTTLRaw)
 	if err != nil {
 		return fmt.Errorf("DEFAULT_LINK_TTL: %w", err)
@@ -255,23 +273,11 @@ func (c *Config) TuneForWorkers(workers int) {
 	}
 
 	if c.windowMaxAuto {
-		w := bots * c.ConnsPerBotPerDC
-		if w < c.profileWindow {
-			w = c.profileWindow
-		}
-		if w > 64 {
-			w = 64
-		}
+		w := min(max(bots*c.ConnsPerBotPerDC, c.profileWindow), 64)
 		c.StreamWindowMax = w
 	}
 	if c.windowMinAuto {
-		m := c.StreamWindowMax / 8
-		if m < 4 {
-			m = 4
-		}
-		if m > 8 {
-			m = 8
-		}
+		m := min(max(c.StreamWindowMax/8, 4), 8)
 		c.StreamWindowMin = m
 	}
 	if c.StreamWindowMin > c.StreamWindowMax {

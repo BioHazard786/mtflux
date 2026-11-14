@@ -188,12 +188,14 @@ type deadlineWriter struct {
 	w       http.ResponseWriter
 	rc      *http.ResponseController
 	metrics *metrics.Metrics
+	sent    int64 // bytes accepted by the client connection
 	err     error // first error returned by the client connection
 }
 
 func (d *deadlineWriter) Write(p []byte) (int, error) {
 	_ = d.rc.SetWriteDeadline(time.Now().Add(writeIdleTimeout))
 	n, err := d.w.Write(p)
+	d.sent += int64(n)
 	if d.metrics != nil && n > 0 {
 		d.metrics.AddBytesServed(int64(n))
 	}
@@ -311,6 +313,7 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	// 7. Start fetching *before* committing to a status: if Telegram can't
 	// serve the first chunk the client gets a real error, not a 200 + empty body.
 	var reader *stream.Reader
+	started := time.Now()
 	if r.Method != http.MethodHead && length > 0 {
 		s.scheduler.Prewarm(meta)
 		reader = stream.NewReader(
@@ -370,12 +373,43 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 9. Stream chunk data using the ordered sliding window reader
+	firstByte := time.Since(started)
 	dw := &deadlineWriter{w: w, rc: http.NewResponseController(w), metrics: s.metrics}
 	_, err = reader.WriteTo(dw)
+
+	// One summary line per download: without it the log cannot tell a slow or
+	// failed download from a healthy one.
+	outcome := "complete"
+	switch {
+	case err == nil:
+	case dw.err != nil || r.Context().Err() != nil:
+		outcome = "client_gone"
+	default:
+		outcome = "upstream_failed"
+	}
+	elapsed := time.Since(started)
+	var mbps float64
+	if sec := elapsed.Seconds(); sec > 0 {
+		mbps = float64(dw.sent) / (1024 * 1024) / sec
+	}
+	s.log.Info("download finished",
+		zap.String("outcome", outcome),
+		zap.Int("msg_id", tok.MsgID),
+		zap.String("file", meta.Filename),
+		zap.Int("dc", meta.DC),
+		zap.String("client", ClientIP(r, s.cfg.TrustedProxyNets)),
+		zap.Int64("range_start", byteRange.Start),
+		zap.Int64("bytes_sent", dw.sent),
+		zap.Int64("bytes_wanted", length),
+		zap.Duration("first_byte", firstByte.Round(time.Millisecond)),
+		zap.Duration("took", elapsed.Round(time.Millisecond)),
+		zap.String("avg_mb_per_s", fmt.Sprintf("%.1f", mbps)),
+	)
+
 	if err == nil {
 		return
 	}
-	if dw.err != nil || r.Context().Err() != nil {
+	if outcome == "client_gone" {
 		return // client disconnected or stalled
 	}
 

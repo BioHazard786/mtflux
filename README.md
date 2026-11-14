@@ -12,7 +12,7 @@ Existing solutions like TG-FileStreamBot top out around ~10 MB/s per bot: one bo
 - **Media-only DCs where they exist.** Telegram's live config advertises media-only addresses for DC 2 and DC 4 only; there each bot gets M parallel-safe connections. Every other DC (and a bot's home DC) gets a regular pool capped at 2 connections per bot, to stay clear of `AUTH_KEY_DUPLICATED`. Foreign DC requests go straight to the file's DC (no `FILE_MIGRATE` round trip).
 - **Warm pools.** Pools are opened on every bot as soon as a download starts; the scheduler prefers warm pools, so no chunk waits for a handshake once any bot is ready.
 - **Sliding window with fast slow-start.** No batch barrier. The window doubles every `STREAM_WINDOW_MIN` chunks up to `STREAM_WINDOW_MAX`, and by default scales to *bots × connections* so one link can keep every slot busy.
-- **Failover, not sleeping.** Flood-wait → that bot cools down and the chunk moves to another bot immediately. A getFile slower than `FETCH_ATTEMPT_TIMEOUT` is abandoned and retried elsewhere. Bots that keep failing are parked.
+- **Failover, not sleeping.** Flood-wait → that bot cools down and the chunk moves to another bot immediately. A getFile slower than `FETCH_ATTEMPT_TIMEOUT` is abandoned at the deadline and retried elsewhere, without waiting for the stalled connection to confirm the cancellation. Bots that keep failing are parked.
 - **Per-bot file references.** Telegram file references are bound to the account that fetched them (verified live: sharing one bot's reference made 13 of 20 bots fail with `FILE_REFERENCE_EXPIRED`). Each bot resolves the log message itself, caches its own location, and only that bot refreshes when Telegram rejects it.
 - **Adaptive concurrency.** A delivery-rate controller (BBR-style) grows the number of RPCs in flight while throughput keeps rising and settles just above the point where it plateaus. On a link slower than the bot fleet this prevents congestion collapse (chunks queueing past their deadline and being downloaded twice); Telegram's heavy latency jitter doesn't fool it. Exposed as `mtflux_fetch_concurrency_limit`.
 - **Urgent chunks first.** Queued chunks are served by distance from their reader's position, so every viewer's next-needed chunk beats anyone's deep read-ahead: a new viewer starts fast even when the server is busy.
@@ -163,6 +163,17 @@ Everything is configured by environment (see [.env.sample](.env.sample)). The st
 | `MTPROTO_OBFUSCATION` | `false` | Obfuscated2 transport; enable only where Telegram is blocked (costs ~9% CPU) |
 | `MAX_BUFFER_MB` | `1024` | Read-ahead budget across all downloads |
 | `CHUNK_CACHE_MB` | `256` | Shared cache for seeks / parallel downloaders |
+| `LOG_LEVEL` | `info` | mtflux's own messages: `debug`, `info`, `warn`, `error` |
+| `TG_LOG_LEVEL` | `warn` | The Telegram client library's messages (several lines per connection at `info`) |
+| `LOG_FORMAT` | `console` | `console` (readable lines) or `json` |
+
+At `LOG_LEVEL=info` every download ends with one summary line, which is the first thing to look at when a download was slow or broke:
+
+```
+2026-11-14 12:00:41.512  INFO  download finished  {"outcome": "complete", "msg_id": 7718, "file": "movie.mkv", "dc": 5, "client": "203.0.113.7", "range_start": 0, "bytes_sent": 536870912, "bytes_wanted": 536870912, "first_byte": "640ms", "took": "24.1s", "avg_mb_per_s": "21.2"}
+```
+
+`outcome` is `complete`, `client_gone` (the client disconnected or stalled) or `upstream_failed` (Telegram could not deliver a chunk; the connection is aborted). `chunk attempt failed, retrying on another bot` lines are routine in small numbers: a slow or failed `getFile` is moved to another bot. A `chunk failed` error means every attempt was used up.
 
 Total in-flight RPCs are additionally capped by the adaptive limiter, so the settings above are ceilings, not targets. Go's heap is soft-limited to `MAX_BUFFER_MB + CHUNK_CACHE_MB + 512` MiB (unless you set `GOMEMLIMIT`). **Rule of thumb for the window:** it should be ≥ bots × M, otherwise slots sit idle. **Rule of thumb for M:** total slots = bots × M; once that exceeds what your VPS link can carry, extra connections only add flood-wait risk. 20 bots × 4 = 80 slots is already past 1 Gbit at typical per-connection speeds.
 

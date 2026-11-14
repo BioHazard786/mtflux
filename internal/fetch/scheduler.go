@@ -285,6 +285,9 @@ func (s *Scheduler) runCall(ctx context.Context, key ChunkKey, c *call, meta *re
 		if s.metrics != nil {
 			s.metrics.CacheBytes.Set(float64(s.cache.UsedBytes()))
 		}
+	} else if ctx.Err() != context.Canceled { // cancelled = every reader left
+		s.log.Error("chunk failed",
+			zap.Int64("doc_id", meta.DocID), zap.Int("chunk", chunkIdx), zap.Int("dc", meta.DC), zap.Error(err))
 	}
 	c.data, c.err = data, err
 
@@ -324,7 +327,7 @@ func (s *Scheduler) fetchWithRetries(ctx context.Context, meta *resolver.FileMet
 
 		attemptCtx, cancel := context.WithTimeout(ctx, timeout)
 		start := time.Now()
-		data, err := s.source.FetchFromWorker(attemptCtx, worker, meta, chunkIdx, offset, limit)
+		data, err, abandoned := s.attempt(attemptCtx, worker, dc, *meta, chunkIdx, offset, limit)
 		attemptTimedOut := err != nil && attemptCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil
 		cancel()
 		elapsed := time.Since(start)
@@ -344,7 +347,9 @@ func (s *Scheduler) fetchWithRetries(ctx context.Context, meta *resolver.FileMet
 			s.metrics.FetchConcurrencyLimit.Set(math.Floor(s.cc.limit))
 		}
 		s.mu.Unlock()
-		s.release(worker, dc)
+		if !abandoned {
+			s.release(worker, dc)
+		}
 
 		if err == nil {
 			worker.RecordChunk(elapsed, len(data))
@@ -363,12 +368,17 @@ func (s *Scheduler) fetchWithRetries(ctx context.Context, meta *resolver.FileMet
 		if s.metrics != nil {
 			s.metrics.ChunkErrorsTotal.WithLabelValues(class.String()).Inc()
 		}
-		s.log.Warn("chunk fetch error",
+		// One failed attempt is routine (the chunk moves to another bot); only
+		// a chunk that runs out of attempts is an error, logged by the caller.
+		s.log.Info("chunk attempt failed, retrying on another bot",
 			zap.Int64("doc_id", meta.DocID),
 			zap.Int("chunk", chunkIdx),
+			zap.Int("dc", dc),
 			zap.Int("failures", failures),
 			zap.String("worker", worker.ID()),
 			zap.String("class", class.String()),
+			zap.Duration("after", elapsed.Round(time.Millisecond)),
+			zap.Bool("timed_out", attemptTimedOut),
 			zap.Error(err),
 		)
 
@@ -434,6 +444,49 @@ func (s *Scheduler) fetchWithRetries(ctx context.Context, meta *resolver.FileMet
 	}
 
 	return nil, fmt.Errorf("%w: %v", ErrMaxRetriesExceeded, lastErr)
+}
+
+type attemptResult struct {
+	data []byte
+	err  error
+}
+
+// attempt runs one getFile on worker and returns as soon as ctx ends, even if
+// the Telegram client has not let go of the request yet.
+//
+// gotd does not return from a cancelled RPC straight away: it sends
+// rpc_drop_answer and waits for the reply on the same connection, for up to
+// 15 s per try. When the deadline fired because that connection is stalled,
+// the reply is stuck behind the same stall (measured live: a call with a 30 s
+// deadline returned after 50.8 s). Waiting for it would hold the chunk, and
+// the reader blocked on it, long after the attempt was given up.
+//
+// abandoned reports that the call is still winding down: its slot stays
+// occupied, so the scheduler sends nothing else down that connection, and is
+// released here once the call returns. The caller must then not release it.
+func (s *Scheduler) attempt(ctx context.Context, worker *gotgtg.Worker, dc int, meta resolver.FileMeta, chunkIdx int, offset, limit int64) (data []byte, err error, abandoned bool) {
+	done := make(chan attemptResult, 1)
+	go func() {
+		d, e := s.source.FetchFromWorker(ctx, worker, &meta, chunkIdx, offset, limit)
+		done <- attemptResult{d, e}
+	}()
+
+	select {
+	case r := <-done:
+		return r.data, r.err, false
+	case <-ctx.Done():
+	}
+	select {
+	case r := <-done: // finished at the same moment: keep the result
+		return r.data, r.err, false
+	default:
+	}
+
+	go func() {
+		<-done
+		s.release(worker, dc)
+	}()
+	return nil, ctx.Err(), true
 }
 
 func classify(err error) (class gotgtg.ErrorClass, wait time.Duration, migrateDC int) {

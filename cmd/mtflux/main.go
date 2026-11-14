@@ -20,6 +20,7 @@ import (
 	"github.com/biohazard786/mtflux/internal/config"
 	"github.com/biohazard786/mtflux/internal/fetch"
 	"github.com/biohazard786/mtflux/internal/httpapi"
+	"github.com/biohazard786/mtflux/internal/logging"
 	"github.com/biohazard786/mtflux/internal/metrics"
 	"github.com/biohazard786/mtflux/internal/resolver"
 	"github.com/biohazard786/mtflux/internal/stream"
@@ -135,19 +136,23 @@ func main() {
 		os.Exit(healthcheck())
 	}
 
-	logger, err := zap.NewProduction()
-	if err != nil {
-		logger = zap.NewNop()
-	}
-	defer func() { _ = logger.Sync() }()
-
-	logger.Info("starting mtflux high-throughput Telegram direct-link server")
-
-	// 1. Load configuration
+	// 1. Load configuration (it decides how we log)
 	cfg, err := config.Load("")
 	if err != nil {
-		logger.Fatal("invalid configuration", zap.Error(err))
+		logging.New(zap.InfoLevel, os.Getenv("LOG_FORMAT")).Fatal("invalid configuration", zap.Error(err))
 	}
+
+	appLevel, _ := logging.ParseLevel(cfg.LogLevel) // validated by config.Load
+	tgLevel, _ := logging.ParseLevel(cfg.TGLogLevel)
+	logger := logging.New(appLevel, cfg.LogFormat)
+	defer func() { _ = logger.Sync() }()
+	// The Telegram library logs several lines per connection at info; it gets
+	// its own level so those don't bury mtflux's messages.
+	gotgtg.SetLibraryLogger(logging.New(tgLevel, cfg.LogFormat))
+
+	logger.Info("starting mtflux high-throughput Telegram direct-link server",
+		zap.String("log_level", appLevel.String()), zap.String("tg_log_level", tgLevel.String()))
+
 	for _, w := range cfg.Warnings() {
 		logger.Warn("config", zap.String("warning", w))
 	}

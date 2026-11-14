@@ -8,6 +8,7 @@ import (
 
 	"github.com/gotd/td/telegram/dcs"
 	"github.com/gotd/td/transport"
+	"go.uber.org/zap"
 )
 
 // socketBufferSize mirrors Telegram Desktop's 2 MB socket buffers.
@@ -46,4 +47,22 @@ func CreateResolver() dcs.Resolver {
 		Network:    "tcp",
 		PreferIPv6: false,
 	})
+}
+
+// libraryLog, when set, receives the Telegram client library's own log output
+// instead of the application logger.
+var libraryLog atomic.Pointer[zap.Logger]
+
+// SetLibraryLogger routes gotd's internal logging (connections, key exchange,
+// retries) to l, so it can run at a different level from mtflux's own
+// messages. Call it once at startup, before creating clients.
+func SetLibraryLogger(l *zap.Logger) { libraryLog.Store(l) }
+
+// LibraryLogger returns the logger gotd clients should use: the one given to
+// SetLibraryLogger, or fallback when none was set.
+func LibraryLogger(fallback *zap.Logger) *zap.Logger {
+	if l := libraryLog.Load(); l != nil {
+		return l
+	}
+	return fallback
 }

@@ -31,6 +31,18 @@ var freshLoginSem = semaphore.NewWeighted(int64(max(2, runtime.NumCPU())))
 // connectTimeout bounds dial + auth-key exchange (gotd's default is 35 s).
 const connectTimeout = 90 * time.Second
 
+// rpcResendInterval replaces gotd's 5 s request-resend timer on worker
+// connections. gotd re-sends a request until the server acknowledges it, but
+// Telegram never acks upload.getFile separately: the 1 MiB answer is the ack.
+// So every chunk that takes longer than 5 s to arrive (a slow or congested
+// link, a cold connection) was requested again every 5 s, and after 5 resends
+// (25 s) gotd failed it with "retry limit reached" no matter how long the
+// scheduler was prepared to wait. Over TCP a resend on the same connection
+// recovers nothing; a dead connection is replaced by gotd and a slow chunk is
+// retried on another bot by the scheduler. This must stay above the
+// scheduler's longest attempt timeout (60 s).
+const rpcResendInterval = 2 * time.Minute
+
 type WorkerStatus int
 
 const (
@@ -128,9 +140,10 @@ func NewWorker(appID int, appHash, token, dataDir string, mConns int, log *zap.L
 	opts := telegram.Options{
 		Resolver:       CreateResolver(),
 		SessionStorage: sessionStorage,
-		Logger:         logzap.New(workerLog),
+		Logger:         logzap.New(LibraryLogger(log).With(zap.String("bot_id", botID))),
 		NoUpdates:      true,
 		DialTimeout:    connectTimeout,
+		RetryInterval:  rpcResendInterval,
 	}
 
 	client := telegram.NewClient(appID, appHash, opts)
