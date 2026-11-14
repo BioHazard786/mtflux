@@ -13,6 +13,7 @@ Existing solutions like TG-FileStreamBot top out around ~10 MB/s per bot: one bo
 - **Warm pools, saved keys.** With `PREWARM_DCS=true` (default) every bot connects to every DC in the background at startup. Each bot's auth key for each DC is saved to disk (gotd itself only keeps the home DC's), so only the very first start pays for key generation; after a restart 20 bots × 5 DCs reconnect in seconds. A chunk is never tied to a bot whose pool is still being created: it goes to whichever bot is ready first.
 - **Sliding window with fast slow-start.** No batch barrier. The window doubles every `STREAM_WINDOW_MIN` chunks up to `STREAM_WINDOW_MAX`, and by default scales to *bots × connections* so one link can keep every slot busy.
 - **Failover, not sleeping.** Flood-wait → that bot cools down and the chunk moves to another bot immediately. A getFile slower than `FETCH_ATTEMPT_TIMEOUT` is abandoned at the deadline and retried elsewhere, without waiting for the stalled connection to confirm the cancellation. Bots that keep failing are parked.
+- **A stalled chunk is fetched twice.** When a getFile takes far longer than chunks from that DC normally do and the download is about to need it, a second bot fetches the same chunk and the first answer wins (`FETCH_HEDGE`). A bot that stalls twice on a DC within two minutes has its connections to that DC replaced. Measured on the A1: one dead connection among 40 froze a 512 MiB download for 3 × 10 s and halved its speed (9.1 MB/s instead of ~20) before this existed.
 - **Per-bot file references.** Telegram file references are bound to the account that fetched them (verified live: sharing one bot's reference made 13 of 20 bots fail with `FILE_REFERENCE_EXPIRED`). Each bot resolves the log message itself, caches its own location, and only that bot refreshes when Telegram rejects it.
 - **Adaptive concurrency.** A delivery-rate controller (BBR-style) grows the number of RPCs in flight while throughput keeps rising and settles just above the point where it plateaus. On a link slower than the bot fleet this prevents congestion collapse (chunks queueing past their deadline and being downloaded twice); Telegram's heavy latency jitter doesn't fool it. Exposed as `mtflux_fetch_concurrency_limit`.
 - **Urgent chunks first.** Queued chunks are served by distance from their reader's position, so every viewer's next-needed chunk beats anyone's deep read-ahead: a new viewer starts fast even when the server is busy.
@@ -51,7 +52,17 @@ What this means for deployment:
 - **Per-connection speed is latency-bound.** `upload.getFile` returns at most 1 MiB, so throughput ≈ requests in flight × 1 MiB ÷ round trip.
 - **Each bot is rate-limited to roughly 20 getFile/s** (`FLOOD_WAIT_1` above ~20 MB/s from one bot). mtflux cools that bot down for the stated second and moves its chunks elsewhere; more bots spread the load.
 - **`CONNS_PER_BOT_PER_DC` above 2 has no effect.** Pools hold 2 connections per bot on every DC.
-- **Auth keys are generated once, then saved.** A bot needs one auth key per DC (~2.7 s of CPU on an A1 core). The first start generates them in the background, one per core at a time: 20 bots × 4 other DCs is about 3.5 minutes on 1 OCPU, during which a download from a DC that isn't warm yet starts on the first ready bot and speeds up as the rest join (measured on the A1 with cold pools: 16.9 MB/s for the first DC 1 download, 66.9 MB/s a minute later). Keys live in `DATA_DIR/sessions/bot_<id>_dc<n>.json`; keep that volume and later starts skip all of this.
+- **Auth keys are generated once, then saved.** A bot needs one auth key per DC (~4 s on an A1 core, of which ~2.7 s is CPU). The first start generates them in the background, one per core at a time: 20 bots × 4 other DCs took 5.5 minutes on 1 OCPU, during which a download from a DC that isn't warm yet starts on the first ready bot and speeds up as the rest join (measured on the A1 with cold pools: 16.9 MB/s for the first DC 1 download, 66.9 MB/s a minute later). Keys live in `DATA_DIR/sessions/bot_<id>_dc<n>.json`; keep that volume and later starts skip all of this.
+
+The same VPS through the HTTP server with every DC warm, downloaded from a second VPS in the same region (one run each):
+
+| File stored on | `curl` (1 connection) | first byte | `aria2c -x16` |
+|---|---|---|---|
+| DC 1 (Miami) | 44 MB/s | 0.6–0.9 s | not measured (the run was served from the chunk cache) |
+| DC 4 (Amsterdam) | 53 MB/s | 1.0 s | not measured |
+| DC 5 (Singapore) | ~20 MB/s without stalls | 2.9 s | 38 MiB/s average, 49 MiB/s peak |
+
+A file that was almost entirely in the chunk cache went out at 106 MiB/s (~890 Mbit/s) over 16 connections, so the HTTP side and the uplink are not what holds one connection at 44–53 MB/s.
 
 Run `mtbench` on your own VPS before tuning: if its raw sweep is flat as bots × connections grow, more bots won't help on that host.
 
@@ -160,6 +171,7 @@ Everything is configured by environment (see [.env.sample](.env.sample)). The st
 | `STREAM_WINDOW_MIN` | auto | Initial window; auto = max/8 clamped to 4–8 |
 | `STREAM_MAX_BOTS` | `0` (all) | Per-download cap on distinct bots; rotates across downloads |
 | `FETCH_ATTEMPT_TIMEOUT` | `10s` | A slower getFile is retried on another bot (stretched automatically on slow links) |
+| `FETCH_HEDGE` | `true` | Fetch a stalled chunk from a second bot when the download is about to need it |
 | `PREWARM_DCS` | `true` | Connect every bot to every DC at startup (background). `false`: a DC is warmed by its first download |
 | `MTPROTO_OBFUSCATION` | `false` | Obfuscated2 transport; enable only where Telegram is blocked (costs ~9% CPU) |
 | `MAX_BUFFER_MB` | `1024` | Read-ahead budget across all downloads |
@@ -171,10 +183,12 @@ Everything is configured by environment (see [.env.sample](.env.sample)). The st
 At `LOG_LEVEL=info` every download ends with one summary line, which is the first thing to look at when a download was slow or broke:
 
 ```
-2026-11-14 12:00:41.512  INFO  download finished  {"outcome": "complete", "msg_id": 7718, "file": "movie.mkv", "dc": 5, "client": "203.0.113.7", "range_start": 0, "bytes_sent": 536870912, "bytes_wanted": 536870912, "first_byte": "640ms", "took": "24.1s", "avg_mb_per_s": "21.2"}
+2026-11-14 12:00:41.512  INFO  download finished  {"outcome": "complete", "msg_id": 7718, "file": "movie.mkv", "dc": 5, "client": "203.0.113.7", "range_start": 0, "bytes_sent": 536870912, "bytes_wanted": 536870912, "first_byte": "640ms", "took": "24.1s", "avg_mb_per_s": "21.2", "cpu_pct": 38, "fetch_limit": 40, "chunk_avg": "1.31s"}
 ```
 
-`outcome` is `complete`, `client_gone` (the client disconnected or stalled) or `upstream_failed` (Telegram could not deliver a chunk; the connection is aborted). `chunk attempt failed, retrying on another bot` lines are routine in small numbers: a slow or failed `getFile` is moved to another bot. A `chunk failed` error means every attempt was used up.
+The last three fields say what held the speed where it was. `cpu_pct` is the whole process's CPU use while the download ran (100 = one core busy; near 100 × cores means the VPS is the limit). `fetch_limit` is how many getFile requests the scheduler currently allows in flight (the ceiling is bots × 2), and `chunk_avg` how long one takes; a download can't go faster than about `fetch_limit ÷ chunk_avg` MiB/s.
+
+`outcome` is `complete`, `client_gone` (the client disconnected or stalled) or `upstream_failed` (Telegram could not deliver a chunk; the connection is aborted). `chunk attempt failed, retrying on another bot` and `chunk stalled on one bot, fetched from another` lines are routine in small numbers: a slow or failed `getFile` is moved to, or duplicated on, another bot. `bot stalled twice on this DC, reconnecting it` means that bot's connections to the DC were replaced. A `chunk failed` error means every attempt was used up.
 
 Total in-flight RPCs are additionally capped by the adaptive limiter, so the settings above are ceilings, not targets. Go's heap is soft-limited to `MAX_BUFFER_MB + CHUNK_CACHE_MB + 512` MiB (unless you set `GOMEMLIMIT`). **Rule of thumb for the window:** it should be ≥ bots × 2, otherwise slots sit idle. Total slots = bots × 2; more bots add slots and spread the per-bot rate limit.
 

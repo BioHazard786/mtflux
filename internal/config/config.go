@@ -75,6 +75,9 @@ type Config struct {
 
 	// FetchAttemptTimeout bounds a single upload.getFile RPC before the chunk is retried on another bot.
 	FetchAttemptTimeout time.Duration `env:"FETCH_ATTEMPT_TIMEOUT" envDefault:"10s"`
+	// FetchHedge fetches a chunk a second time from another bot when its
+	// request stalls and a reader is about to need it.
+	FetchHedge bool `env:"FETCH_HEDGE" envDefault:"true"`
 
 	// Memory & Caching
 	MaxBufferMB  int `env:"MAX_BUFFER_MB" envDefault:"1024"`

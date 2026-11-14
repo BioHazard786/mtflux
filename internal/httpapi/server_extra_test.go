@@ -242,3 +242,54 @@ func TestMetricsOnlyMountedWithTokenOnPublicPort(t *testing.T) {
 		t.Errorf("valid bearer -> %d, want 200", rr.Code)
 	}
 }
+
+// gatedSource holds every chunk back until the gate is closed.
+type gatedSource struct {
+	failingAt
+	gate chan struct{}
+}
+
+func (g *gatedSource) FetchFromWorker(ctx context.Context, w *gotgtg.Worker, m *resolver.FileMeta, idx int, off, lim int64) ([]byte, error) {
+	select {
+	case <-g.gate:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return g.failingAt.FetchFromWorker(ctx, w, m, idx, off, lim)
+}
+
+// A request that arrives while the client is at its per-IP limit waits a
+// moment for one of the client's other connections to finish (live: aria2c
+// -x16 at MAX_STREAMS_PER_IP=16 got a 429 mid-download and dropped a
+// connection for good).
+func TestRequestAtPerIPLimitWaitsForAFreeSlot(t *testing.T) {
+	src := &gatedSource{failingAt: failingAt{size: 1 << 20, failAt: -1}, gate: make(chan struct{})}
+	srv, path := newExtraServer(t, src, 1<<20, "video/mp4", nil, 1)
+
+	first := make(chan int, 1)
+	go func() {
+		resp, err := http.Get(srv.URL + path)
+		if err != nil {
+			first <- 0
+			return
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		first <- resp.StatusCode
+	}()
+	time.Sleep(100 * time.Millisecond) // the first request now holds the only slot
+	time.AfterFunc(200*time.Millisecond, func() { close(src.gate) })
+
+	resp, err := http.Get(srv.URL + path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("second request got %d, want 200 once the first finished", resp.StatusCode)
+	}
+	if got := <-first; got != http.StatusOK {
+		t.Errorf("first request got %d, want 200", got)
+	}
+}

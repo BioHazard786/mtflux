@@ -72,8 +72,11 @@ const (
 	// failuresBeforeCooldown consecutive failures park a worker briefly so a
 	// sick bot or DC doesn't keep eating retries.
 	failuresBeforeCooldown = 3
-	maxFailureCooldown     = 60 * time.Second
-	minFailureLatencyMs    = 500.0
+	// stallWindow: a second stalled request to the same DC within this time
+	// means the connection is dead rather than one answer being slow.
+	stallWindow         = 2 * time.Minute
+	maxFailureCooldown  = 60 * time.Second
+	minFailureLatencyMs = 500.0
 )
 
 // authError marks a bot-token authentication failure, which is not retried.
@@ -104,6 +107,7 @@ type Worker struct {
 	cooldownUntil time.Time
 	ewmaLatencyMs float64
 	consecFails   int
+	lastStall     map[int]time.Time // dc -> last stalled request
 
 	inflight     atomic.Int32
 	totalBytes   atomic.Uint64
@@ -359,8 +363,18 @@ func (w *Worker) WarmPool(ctx context.Context, dc int) error {
 	if w.poolManager == nil {
 		return errNoPoolManager
 	}
-	_, err := w.poolManager.GetPoolBackground(ctx, dc)
-	return err
+	pool, err := w.poolManager.GetPoolBackground(ctx, dc)
+	if err != nil {
+		return err
+	}
+	if pool.opened != nil {
+		select {
+		case <-pool.opened:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
 }
 
 // PoolNeedsKey reports whether opening the pool for dc has to generate a new
@@ -537,6 +551,34 @@ func (w *Worker) RecordFailure() {
 			d = maxFailureCooldown
 		}
 		w.SetCooldown(d)
+	}
+}
+
+// RecordStall notes that a request of this worker to dc got no answer while
+// other bots were being served. It moves the worker behind its peers and
+// reports whether this is the second stall on that DC within stallWindow, in
+// which case the caller should replace the pool's connections.
+func (w *Worker) RecordStall(dc int) (repeated bool) {
+	now := time.Now()
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	w.ewmaLatencyMs = max(w.ewmaLatencyMs*1.5, minFailureLatencyMs)
+	if last, ok := w.lastStall[dc]; ok && now.Sub(last) < stallWindow {
+		delete(w.lastStall, dc)
+		return true
+	}
+	if w.lastStall == nil {
+		w.lastStall = make(map[int]time.Time)
+	}
+	w.lastStall[dc] = now
+	return false
+}
+
+// ReconnectPool replaces the connections to dc, keeping the auth key.
+func (w *Worker) ReconnectPool(dc int) {
+	if w.poolManager != nil {
+		w.poolManager.Reconnect(dc)
 	}
 }
 

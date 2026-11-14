@@ -80,3 +80,25 @@ func TestSlotLimitWithoutPoolFallsBackToConfiguredConns(t *testing.T) {
 		t.Fatal("no pool manager means no ready pool")
 	}
 }
+
+// One stalled request is noted; a second one to the same DC soon after asks
+// for a reconnect, and the count then starts over.
+func TestWorker_RecordStall(t *testing.T) {
+	w := &Worker{}
+	if w.RecordStall(5) {
+		t.Error("first stall must not ask for a reconnect")
+	}
+	if w.RecordStall(1) {
+		t.Error("a stall on another DC must not count")
+	}
+	if !w.RecordStall(5) {
+		t.Error("second stall on the same DC must ask for a reconnect")
+	}
+	if w.RecordStall(5) {
+		t.Error("the count must start over after a reconnect")
+	}
+	if w.EWMALatencyMs() < minFailureLatencyMs {
+		t.Error("a stalled bot must rank behind its peers")
+	}
+	w.ReconnectPool(5) // no pool manager: must not panic
+}

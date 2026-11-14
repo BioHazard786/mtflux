@@ -270,6 +270,7 @@ wait:
 	)
 	sched.SetSource(fetch.NewTelegramChunkSource(cfg.LogChannelID))
 	sched.SetTimeouts(cfg.FetchAttemptTimeout, 0)
+	sched.SetHedging(cfg.FetchHedge)
 	budget := stream.NewGlobalBudget(cfg.MaxBufferMB)
 
 	go publishWorkerStats(ctx, workers, m)

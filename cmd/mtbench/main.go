@@ -412,6 +412,7 @@ func e2eRun(ctx context.Context, src *fetch.TelegramChunkSource, workers []*gotg
 	sched := fetch.NewScheduler(workers, chunkSize, 0, 0, nil, nil, zap.NewNop())
 	sched.SetSource(src)
 	sched.SetTimeouts(cfg.FetchAttemptTimeout, 0)
+	sched.SetHedging(cfg.FetchHedge)
 	sched.Prewarm(meta)
 
 	size := int64(n) * chunkSize

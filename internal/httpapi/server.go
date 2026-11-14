@@ -205,6 +205,34 @@ func (d *deadlineWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
+// streamSlotGrace is how long a request over the per-IP limit waits for one of
+// the client's other connections to finish before it is refused.
+const streamSlotGrace = 2 * time.Second
+
+// acquireStream takes a stream slot for the client, waiting briefly when the
+// client is at its per-IP limit.
+//
+// A segmented downloader running exactly at the limit (aria2c -x16 against
+// MAX_STREAMS_PER_IP=16) closes one connection and opens the next at the same
+// moment, and the new request can arrive before the old handler has noticed
+// its client is gone. Refusing it outright makes the downloader drop that
+// connection for good (seen live as a 429 mid-download).
+func (s *Server) acquireStream(r *http.Request) (func(), error) {
+	ip := ClientIP(r, s.cfg.TrustedProxyNets)
+	deadline := time.Now().Add(streamSlotGrace)
+	for {
+		release, err := s.access.AcquireStream(ip)
+		if !errors.Is(err, access.ErrMaxStreamsPerIPReached) || time.Now().After(deadline) {
+			return release, err
+		}
+		select {
+		case <-r.Context().Done():
+			return nil, err
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
+}
+
 func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	tokenStr := r.PathValue("token")
 	if tokenStr == "" {
@@ -234,7 +262,7 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 
 	// 3. Acquire stream slot (concurrency enforcement), keyed by the real client IP
 	if s.access != nil {
-		releaseStream, err := s.access.AcquireStream(ClientIP(r, s.cfg.TrustedProxyNets))
+		releaseStream, err := s.acquireStream(r)
 		if err != nil {
 			if errors.Is(err, access.ErrMaxStreamsPerIPReached) || errors.Is(err, access.ErrMaxActiveStreamsReached) {
 				w.Header().Set("Retry-After", "2")
@@ -374,6 +402,7 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 
 	// 9. Stream chunk data using the ordered sliding window reader
 	firstByte := time.Since(started)
+	cpuStart := processCPUTime()
 	dw := &deadlineWriter{w: w, rc: http.NewResponseController(w), metrics: s.metrics}
 	_, err = reader.WriteTo(dw)
 
@@ -388,6 +417,7 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		outcome = "upstream_failed"
 	}
 	elapsed := time.Since(started)
+	fetchLimit, chunkAvg := s.scheduler.Load()
 	var mbps float64
 	if sec := elapsed.Seconds(); sec > 0 {
 		mbps = float64(dw.sent) / (1024 * 1024) / sec
@@ -404,6 +434,12 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		zap.Duration("first_byte", firstByte.Round(time.Millisecond)),
 		zap.Duration("took", elapsed.Round(time.Millisecond)),
 		zap.String("avg_mb_per_s", fmt.Sprintf("%.1f", mbps)),
+		// What held the speed where it was: the whole process's CPU use while
+		// this download ran (100 = one core busy), how many getFile requests
+		// the scheduler allows in flight, and how long one chunk takes.
+		zap.Int("cpu_pct", cpuPercent(processCPUTime()-cpuStart, elapsed-firstByte)),
+		zap.Int("fetch_limit", fetchLimit),
+		zap.Duration("chunk_avg", chunkAvg.Round(time.Millisecond)),
 	)
 
 	if err == nil {

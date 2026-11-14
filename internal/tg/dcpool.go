@@ -45,6 +45,9 @@ const poolCreateTimeout = 45 * time.Second
 // itself bounded by poolCreateTimeout, so the queue always drains.
 const poolQueueTimeout = 5 * time.Minute
 
+// openConnsTimeout bounds dialing a new pool's connections ahead of use.
+const openConnsTimeout = 20 * time.Second
+
 // MaxPoolConns caps connections per (bot, DC) pool. These are regular
 // connections sharing one auth key, where Telegram answers too many parallel
 // sessions with AUTH_KEY_DUPLICATED.
@@ -68,7 +71,12 @@ type DCPool struct {
 
 	// Set for pools backed by their own saved session (see dcSession).
 	stop    context.CancelFunc
-	discard atomic.Bool // delete the saved session once the client has stopped
+	stopped chan struct{} // closed once that session's client has shut down
+	discard atomic.Bool   // delete the saved session once the client has stopped
+
+	// opened is closed once every connection of the pool has been dialed (or
+	// the attempt gave up); nil for pools that were never pre-opened.
+	opened chan struct{}
 }
 
 // Close closes the pool's connections.
@@ -202,9 +210,11 @@ func (pm *PoolManager) getPool(ctx context.Context, dc int, background bool) (*D
 			return nil, err
 		}
 
+		pool.opened = make(chan struct{})
 		pm.mu.Lock()
 		pm.pools[dc] = pool
 		pm.mu.Unlock()
+		go pm.openConns(pool)
 		if pool.Restored {
 			pm.log.Debug("dc pool opened", zap.Int("dc", dc), zap.Int("slots", pool.Slots))
 		} else {
@@ -222,6 +232,34 @@ func (pm *PoolManager) getPool(ctx context.Context, dc int, background bool) (*D
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
+}
+
+// openConns dials every connection of a new pool.
+//
+// gotd opens a pool's connections on demand, and the second one only once two
+// requests overlap. Left at that, the first chunks of the first download from
+// a DC also pay for the dial and session setup (about a second to a far DC),
+// and a connection that is broken from the start is found by a download
+// instead of by gotd's keepalive ping.
+func (pm *PoolManager) openConns(pool *DCPool) {
+	defer close(pool.opened)
+	if pool.Invoker == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), openConnsTimeout)
+	defer cancel()
+
+	api := tg.NewClient(pool.Invoker)
+	var wg sync.WaitGroup
+	for range pool.Slots {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Any cheap call will do; concurrent calls each need a connection.
+			_, _ = api.HelpGetNearestDC(ctx)
+		}()
+	}
+	wg.Wait()
 }
 
 func (pm *PoolManager) homeDC() int {
@@ -296,9 +334,11 @@ func (pm *PoolManager) createSavedPool(ctx context.Context, dc, conns int) (*DCP
 	pool := &DCPool{DC: dc, Slots: conns, Restored: restored}
 	runCtx, stop := context.WithCancel(context.Background())
 	pool.stop = stop
+	pool.stopped = make(chan struct{})
 
 	ready := make(chan error, 1)
 	go func() {
+		defer close(pool.stopped)
 		err := client.Run(runCtx, func(rctx context.Context) error {
 			invoker, err := client.Pool(int64(conns))
 			if err != nil || invoker == nil {
@@ -414,6 +454,39 @@ func (pm *PoolManager) InvalidatePool(dc int) {
 		}
 		_ = pool.Close()
 	}
+}
+
+// Reconnect replaces the connections of the pool for dc and keeps its auth
+// key. It is for a pool whose connection has stopped answering: gotd only
+// notices that with its keepalive ping, up to 75 s later, and until then
+// hands the dead connection to every other request.
+func (pm *PoolManager) Reconnect(dc int) {
+	pm.mu.Lock()
+	pool, ok := pm.pools[dc]
+	if ok {
+		delete(pm.pools, dc)
+	}
+	pm.mu.Unlock()
+	if !ok || pool == nil {
+		return
+	}
+	_ = pool.Close()
+
+	go func() {
+		if pool.stopped != nil {
+			// Let the old session's client finish first: both read and write
+			// the same session file.
+			select {
+			case <-pool.stopped:
+			case <-time.After(10 * time.Second):
+			}
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), poolCreateTimeout)
+		defer cancel()
+		if _, err := pm.GetPool(ctx, dc); err != nil {
+			pm.log.Warn("reopening dc pool failed, it will be retried on next use", zap.Int("dc", dc), zap.Error(err))
+		}
+	}()
 }
 
 // CloseAll closes all open DC pools.
