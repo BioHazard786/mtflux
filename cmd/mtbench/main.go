@@ -444,7 +444,10 @@ func e2eRun(ctx context.Context, src *fetch.TelegramChunkSource, workers []*gotg
 	} else if got != size {
 		result = fmt.Sprintf("SHORT: %d of %d bytes", got, size)
 	}
-	fmt.Printf("%-8d %6.1f MB/s  %-12s %s\n", window, float64(got)/(1<<20)/elapsed, ttfb.Round(time.Millisecond), result)
+	load := sched.Load()
+	fmt.Printf("%-8d %6.1f MB/s  %-12s %s | in-flight limit %d, %s per chunk, %d chunk(s) fetched twice (%d won)\n",
+		window, float64(got)/(1<<20)/elapsed, ttfb.Round(time.Millisecond), result,
+		load.Limit, load.ChunkAvg.Round(time.Millisecond), load.Hedges, load.HedgeWins)
 }
 
 func parseInts(s string, def []int) []int {

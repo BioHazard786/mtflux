@@ -16,8 +16,10 @@ import (
 type stallSource struct {
 	firstDelay, laterDelay time.Duration
 
-	mu    sync.Mutex
-	calls map[int][]stallCall
+	mu        sync.Mutex
+	calls     map[int][]stallCall
+	answered  int // requests that ran to their answer
+	cancelled int // requests whose context ended first
 }
 
 type stallCall struct {
@@ -38,16 +40,30 @@ func (s *stallSource) FetchFromWorker(ctx context.Context, w *gotgtg.Worker, _ *
 	if n == 0 {
 		delay, body = s.firstDelay, "first"
 	}
+	count := func(n *int) {
+		s.mu.Lock()
+		*n++
+		s.mu.Unlock()
+	}
 	if delay < 0 {
 		<-ctx.Done()
+		count(&s.cancelled)
 		return nil, ctx.Err()
 	}
 	select {
 	case <-ctx.Done():
+		count(&s.cancelled)
 		return nil, ctx.Err()
 	case <-time.After(delay):
+		count(&s.answered)
 		return []byte(body), nil
 	}
+}
+
+func (s *stallSource) outcomes() (answered, cancelled int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.answered, s.cancelled
 }
 
 func (s *stallSource) callsFor(idx int) []stallCall {
@@ -108,6 +124,90 @@ func TestScheduler_SlowFirstRequestCanStillWin(t *testing.T) {
 	}
 }
 
+// When the second copy wins, the first request is left to finish. A late
+// answer shows the bot was slow, not dead: it is not blamed (live: two healthy
+// bots were reconnected within one download for being slow twice), and the
+// answer's real duration feeds the timing that decides what "stalled" means.
+func TestScheduler_BeatenFirstRequestRunsOnAndIsNotBlamed(t *testing.T) {
+	// Stalled after 1 s; the first request answers after 1.4 s, the second
+	// copy long before that.
+	src := &stallSource{firstDelay: 1400 * time.Millisecond, laterDelay: 5 * time.Millisecond}
+	s := newHedgeScheduler(t, src, 2*time.Second)
+	meta := &resolver.FileMeta{DocID: 1, DC: 2}
+
+	for chunk := range 2 { // twice: a second "stall" must not trigger a reconnect either
+		data, err := s.FetchChunk(context.Background(), meta, chunk)
+		if err != nil || string(data) != "later" {
+			t.Fatalf("chunk %d: got %q, %v; want the second copy", chunk, data, err)
+		}
+	}
+	if l := s.Load(); l.Hedges != 2 || l.HedgeWins != 2 {
+		t.Errorf("hedges %d, wins %d; want 2 and 2", l.Hedges, l.HedgeWins)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		answered, cancelled := src.outcomes()
+		if cancelled > 0 {
+			t.Fatalf("%d request(s) were cancelled; the beaten first request must run on", cancelled)
+		}
+		if answered == 4 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d of 4 requests answered", answered)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	for chunk := range 2 {
+		if w := src.callsFor(chunk)[0].worker; w.EWMALatencyMs() >= 5000 {
+			t.Errorf("bot %s was penalised as stalled (latency %.0f ms)", w.ID(), w.EWMALatencyMs())
+		}
+	}
+	s.mu.Lock()
+	n := s.chunkTimes[2].n
+	s.mu.Unlock()
+	if n != 4 {
+		t.Errorf("%d timing samples, want 4 (the slow answers must count)", n)
+	}
+}
+
+// A first request that never answers is caught at its deadline even though
+// the chunk was delivered long before, and counts against its bot.
+func TestScheduler_DeadFirstRequestIsBlamedAtItsDeadline(t *testing.T) {
+	const timeout = 600 * time.Millisecond
+	src := &stallSource{firstDelay: -1, laterDelay: time.Millisecond}
+	s := newHedgeScheduler(t, src, timeout)
+	meta := &resolver.FileMeta{DocID: 1, DC: 2}
+
+	if _, err := s.FetchChunk(context.Background(), meta, 0); err != nil {
+		t.Fatal(err)
+	}
+	// Other chunks keep arriving while the dead request sits there.
+	src.mu.Lock()
+	for i := 1; i <= 60; i++ {
+		src.calls[i] = []stallCall{{}}
+	}
+	src.mu.Unlock()
+	for i := 1; i <= 60; i++ {
+		if _, err := s.FetchChunk(context.Background(), meta, i); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	dead := src.callsFor(0)[0].worker
+	deadline := time.Now().Add(3 * time.Second)
+	for dead.EWMALatencyMs() < 500 {
+		if time.Now().After(deadline) {
+			t.Fatalf("the bot whose request never answered was not marked (latency %.0f ms)", dead.EWMALatencyMs())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if n := len(src.callsFor(0)); n != 2 {
+		t.Errorf("chunk 0 was requested %d times, want 2 (no retry after delivery)", n)
+	}
+}
+
 // Deep read-ahead is not fetched twice: nobody is waiting for it yet, and on
 // a slow link every chunk is late at once.
 func TestScheduler_ReadAheadIsNotFetchedTwice(t *testing.T) {
@@ -152,8 +252,8 @@ func TestScheduler_StallAfterFollowsChunkTimes(t *testing.T) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if got := s.stallAfterLocked(1, timeout); got != timeout/3 {
-		t.Errorf("no samples: got %v, want a third of the deadline", got)
+	if got := s.stallAfterLocked(1, timeout); got != timeout/2 {
+		t.Errorf("no samples: got %v, want half the deadline", got)
 	}
 
 	fast := &chunkTime{}
@@ -196,7 +296,7 @@ func TestScheduler_TimeoutBlamesTheBotOnlyWhenOthersDeliver(t *testing.T) {
 		src := &stallSource{firstDelay: -1, laterDelay: time.Millisecond}
 		s := newHedgeScheduler(t, src, timeout)
 		s.SetHedging(false)
-		limitBefore, _ = s.Load()
+		limitBefore = s.Load().Limit
 
 		done := make(chan error, 1)
 		go func() {
@@ -221,7 +321,7 @@ func TestScheduler_TimeoutBlamesTheBotOnlyWhenOthersDeliver(t *testing.T) {
 		if err := <-done; err != nil {
 			t.Fatal(err)
 		}
-		limitAfter, _ = s.Load()
+		limitAfter = s.Load().Limit
 		return src.callsFor(0)[0].worker, limitBefore, limitAfter
 	}
 

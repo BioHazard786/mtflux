@@ -107,6 +107,20 @@ type flight struct {
 	stallAfter time.Duration
 }
 
+// race is the state shared by the two copies of one chunk download.
+type race struct {
+	flight    atomic.Pointer[flight] // the first copy's request, while one is out
+	delivered atomic.Bool            // the second copy has already delivered the chunk
+}
+
+// Load is a snapshot of how busy the scheduler is, for the per-download log line.
+type Load struct {
+	Limit     int           // getFile requests allowed in flight right now
+	ChunkAvg  time.Duration // smoothed time one chunk takes
+	Hedges    int64         // chunks fetched a second time since start
+	HedgeWins int64         // of those, how often the second copy came first
+}
+
 // call is one in-flight chunk download shared by every stream that wants it.
 type call struct {
 	prio   Priority
@@ -141,6 +155,8 @@ type Scheduler struct {
 	retryArmed bool
 	chunkTimes map[int]*chunkTime // per DC
 	hedge      bool
+	hedges     atomic.Int64
+	hedgeWins  atomic.Int64
 
 	// in-flight chunk dedup
 	callsMu sync.Mutex
@@ -226,12 +242,16 @@ func (s *Scheduler) SetTimeouts(attempt, budget time.Duration) {
 // SetHedging turns fetching a stalled chunk from a second bot on or off.
 func (s *Scheduler) SetHedging(on bool) { s.hedge = on }
 
-// Load reports the current limit on getFile requests in flight and the
-// smoothed time one chunk takes, for the per-download log line.
-func (s *Scheduler) Load() (limit int, chunkAvg time.Duration) {
+// Load reports how busy the scheduler is.
+func (s *Scheduler) Load() Load {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return int(math.Floor(s.cc.limit)), time.Duration(s.cc.avgMs * float64(time.Millisecond))
+	return Load{
+		Limit:     int(math.Floor(s.cc.limit)),
+		ChunkAvg:  time.Duration(s.cc.avgMs * float64(time.Millisecond)),
+		Hedges:    s.hedges.Load(),
+		HedgeWins: s.hedgeWins.Load(),
+	}
 }
 
 // Workers returns the worker list (read-only).
@@ -377,6 +397,14 @@ func (s *Scheduler) runCall(ctx context.Context, key ChunkKey, c *call, meta *re
 // deadline instead would kill requests that are merely slow, which on a slow
 // link is most of them; a second copy costs one extra chunk and never delays
 // the first.
+//
+// When the second copy wins, the first request is not cancelled: it runs on
+// to its answer or its deadline. Most such requests are slow, not dead (on
+// the VPS about 2% of DC 5 chunks take over twice the usual time), and only
+// the outcome tells the two apart: a late answer is a timing sample that
+// keeps "far longer than normal" honest, a deadline with no answer counts
+// against the bot. Blaming the bot as soon as the second copy won reconnected
+// healthy bots twice within one download.
 func (s *Scheduler) fetchHedged(ctx context.Context, meta *resolver.FileMeta, chunkIdx, stripe int, prio Priority) ([]byte, error) {
 	if !s.hedge {
 		return s.fetchWithRetries(ctx, meta, chunkIdx, stripe, prio, nil, nil)
@@ -386,22 +414,35 @@ func (s *Scheduler) fetchHedged(ctx context.Context, meta *resolver.FileMeta, ch
 		data []byte
 		err  error
 	}
-	var watch atomic.Pointer[flight]
+	rc := &race{}
 
-	// Both copies stop when this returns; the loser is abandoned mid-request
-	// (see attempt) and gives its slot back once the client lets go of it.
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
+	// The first copy outlives this call only once the chunk is delivered;
+	// until then it ends with ctx like everything else: cancelled when ctx
+	// is, and out of time when ctx is (it keeps the same deadline, so the
+	// caller still sees a timeout as a timeout).
+	fctx, fcancel := context.WithCancel(context.WithoutCancel(ctx))
+	if deadline, ok := ctx.Deadline(); ok {
+		fctx, fcancel = context.WithDeadline(context.WithoutCancel(ctx), deadline)
+	}
+	stopWatching := context.AfterFunc(ctx, func() {
+		if !rc.delivered.Load() && ctx.Err() == context.Canceled {
+			fcancel()
+		}
+	})
 	first := make(chan result, 1)
 	go func() {
-		d, err := s.fetchWithRetries(ctx, meta, chunkIdx, stripe, prio, nil, &watch)
+		defer fcancel()
+		defer stopWatching()
+		d, err := s.fetchWithRetries(fctx, meta, chunkIdx, stripe, prio, nil, rc)
 		first <- result{d, err}
 	}()
 
+	// The second copy is simply dropped if the first one wins.
+	hctx, hcancel := context.WithCancel(ctx)
+	defer hcancel()
+
 	var (
 		second   chan result
-		slow     *flight // the request the second copy was started for
 		hedged   bool
 		firstErr error
 	)
@@ -418,14 +459,8 @@ func (s *Scheduler) fetchHedged(ctx context.Context, meta *resolver.FileMeta, ch
 
 		case r := <-second:
 			if r.err == nil {
-				if watch.Load() == slow {
-					// The first request is still out: its connection stalled.
-					s.log.Info("chunk stalled on one bot, fetched from another",
-						zap.Int64("doc_id", meta.DocID), zap.Int("chunk", chunkIdx), zap.Int("dc", slow.dc),
-						zap.String("stalled_worker", slow.worker.ID()),
-						zap.Duration("stalled_for", time.Since(slow.start).Round(time.Millisecond)))
-					s.blameStall(slow.worker, slow.dc)
-				}
+				rc.delivered.Store(true)
+				s.hedgeWins.Add(1)
 				return r.data, nil
 			}
 			if first == nil {
@@ -438,16 +473,16 @@ func (s *Scheduler) fetchHedged(ctx context.Context, meta *resolver.FileMeta, ch
 				continue
 			}
 			next := hedgePoll
-			if f := watch.Load(); f != nil {
+			if f := rc.flight.Load(); f != nil {
 				switch waited := time.Since(f.start); {
 				case waited < f.stallAfter:
 					next = max(f.stallAfter-waited, time.Millisecond)
 				case prio.value() <= hedgeAhead:
-					hedged, slow = true, f
+					hedged = true
+					s.hedges.Add(1)
 					second = make(chan result, 1)
-					m := *meta
 					go func() {
-						d, err := s.fetchWithRetries(ctx, &m, chunkIdx, stripe, prio, f.worker, nil)
+						d, err := s.fetchWithRetries(hctx, meta, chunkIdx, stripe, prio, f.worker, nil)
 						second <- result{d, err}
 					}()
 					s.log.Debug("chunk is slow, fetching a second copy",
@@ -461,20 +496,23 @@ func (s *Scheduler) fetchHedged(ctx context.Context, meta *resolver.FileMeta, ch
 	}
 }
 
-// blameStall records a stalled request against its bot and, when the bot
-// stalls again soon after, replaces its connections to that DC.
+// blameStall records a request that got no answer by its deadline against
+// its bot and, when that happens again soon after, replaces the bot's
+// connections to that DC.
 func (s *Scheduler) blameStall(w *gotgtg.Worker, dc int) {
 	if w.RecordStall(dc) {
-		s.log.Warn("bot stalled twice on this DC, reconnecting it", zap.String("worker", w.ID()), zap.Int("dc", dc))
+		s.log.Warn("bot got no answer twice on this DC, reconnecting it", zap.String("worker", w.ID()), zap.Int("dc", dc))
 		w.ReconnectPool(dc)
 	}
 }
 
 // stallAfterLocked returns how long a getFile to dc may run before it counts
-// as stalled: well beyond what chunks from that DC have been taking, and a
-// third of the attempt deadline until enough of them have been seen.
+// as stalled: well beyond what chunks from that DC have been taking, and half
+// the attempt deadline until enough of them have been seen. (A third was too
+// eager on a slow link: 6 of the first 24 chunks were fetched twice and only
+// one of the copies was needed.)
 func (s *Scheduler) stallAfterLocked(dc int, timeout time.Duration) time.Duration {
-	d := timeout / 3
+	d := timeout / 2
 	if t := s.chunkTimes[dc]; t != nil && t.n >= minStallSamples {
 		d = time.Duration((t.avg + 4*t.dev) * float64(time.Millisecond))
 	}
@@ -482,9 +520,11 @@ func (s *Scheduler) stallAfterLocked(dc int, timeout time.Duration) time.Duratio
 }
 
 // fetchWithRetries downloads a chunk, moving to another bot after each failed
-// attempt. avoid, if set, is a bot to pass over while another one is free;
-// watch, if set, is kept pointing at the request currently in flight.
-func (s *Scheduler) fetchWithRetries(ctx context.Context, meta *resolver.FileMeta, chunkIdx, stripe int, prio Priority, avoid *gotgtg.Worker, watch *atomic.Pointer[flight]) ([]byte, error) {
+// attempt. avoid, if set, is a bot to pass over while another one is free.
+// rc, if set, marks this as the first copy of a hedged download: its request
+// in flight is published there, and it stops after the current request once
+// the other copy has delivered.
+func (s *Scheduler) fetchWithRetries(ctx context.Context, meta *resolver.FileMeta, chunkIdx, stripe int, prio Priority, avoid *gotgtg.Worker, rc *race) ([]byte, error) {
 	own := *meta // retries may rewrite the DC or file reference
 	meta = &own
 
@@ -497,9 +537,14 @@ func (s *Scheduler) fetchWithRetries(ctx context.Context, meta *resolver.FileMet
 	floods := 0
 	maxFloods := 2*len(s.workers) + 2
 
+	superseded := func() bool { return rc != nil && rc.delivered.Load() }
+
 	for failures < maxFailedAttempts {
 		if err := ctx.Err(); err != nil {
 			return nil, joinErr(lastErr, err)
+		}
+		if superseded() {
+			return nil, lastErr
 		}
 
 		dc := meta.DC
@@ -534,14 +579,14 @@ func (s *Scheduler) fetchWithRetries(ctx context.Context, meta *resolver.FileMet
 
 		attemptCtx, cancel := context.WithTimeout(ctx, timeout)
 		start := time.Now()
-		if watch != nil {
-			watch.Store(&flight{worker: worker, dc: dc, start: start, stallAfter: stallAfter})
+		if rc != nil {
+			rc.flight.Store(&flight{worker: worker, dc: dc, start: start, stallAfter: stallAfter})
 		}
 		data, err, abandoned := s.attempt(attemptCtx, worker, dc, *meta, chunkIdx, offset, limit)
 		attemptTimedOut := err != nil && attemptCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil
 		cancel()
-		if watch != nil {
-			watch.Store(nil)
+		if rc != nil {
+			rc.flight.Store(nil)
 		}
 		elapsed := time.Since(start)
 
@@ -602,7 +647,11 @@ func (s *Scheduler) fetchWithRetries(ctx context.Context, meta *resolver.FileMet
 		}
 		// One failed attempt is routine (the chunk moves to another bot); only
 		// a chunk that runs out of attempts is an error, logged by the caller.
-		s.log.Info("chunk attempt failed, retrying on another bot",
+		logAttempt := s.log.Info
+		if superseded() {
+			logAttempt = s.log.Debug // already delivered by the other copy; nothing is retried
+		}
+		logAttempt("chunk attempt failed, retrying on another bot",
 			zap.Int64("doc_id", meta.DocID),
 			zap.Int("chunk", chunkIdx),
 			zap.Int("dc", dc),

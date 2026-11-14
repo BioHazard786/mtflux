@@ -79,9 +79,15 @@ func TestTuneForWorkers(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cfg.TuneForWorkers(20) // 20 bots × 4 conns = 80 slots -> capped at 64
-	if cfg.StreamWindowMax != 64 || cfg.StreamWindowMin != 8 {
-		t.Errorf("20 bots: window %d..%d, want 8..64", cfg.StreamWindowMin, cfg.StreamWindowMax)
+	cfg.TuneForWorkers(20) // 20 bots × 2 real conns = 40 slots, × 3 = 120
+	if cfg.StreamWindowMax != 120 || cfg.StreamWindowMin != 8 {
+		t.Errorf("20 bots: window %d..%d, want 8..120", cfg.StreamWindowMin, cfg.StreamWindowMax)
+	}
+
+	cfgBig, _ := Load("/nonexistent")
+	cfgBig.TuneForWorkers(40) // 80 slots × 3 = 240 -> capped at the maximum
+	if cfgBig.StreamWindowMax != maxWindow {
+		t.Errorf("40 bots: window max %d, want the cap %d", cfgBig.StreamWindowMax, maxWindow)
 	}
 
 	cfg2, _ := Load("/nonexistent")
@@ -100,8 +106,8 @@ func TestTuneForWorkers(t *testing.T) {
 	t.Setenv("STREAM_WINDOW_MAX", "")
 	t.Setenv("STREAM_MAX_BOTS", "5")
 	cfg4, _ := Load("/nonexistent")
-	cfg4.TuneForWorkers(20) // 5 bots × 4 = 20
-	if cfg4.StreamWindowMax != 20 {
+	cfg4.TuneForWorkers(20) // 5 bots × 2 real conns × 3 = 30
+	if cfg4.StreamWindowMax != 30 {
 		t.Errorf("per-stream bot cap should bound the window, got %d", cfg4.StreamWindowMax)
 	}
 }

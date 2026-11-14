@@ -68,6 +68,9 @@ type Reader struct {
 	maxWindow     int
 	currentWindow int
 	chunksRead    int
+	// waited records that the reader had to wait for a chunk since the window
+	// was last considered for growth, i.e. the client is keeping up.
+	waited bool
 
 	nextLaunchChunk int
 	activeFutures   []*chunkFuture
@@ -230,13 +233,18 @@ func (r *Reader) advanceHeadChunkLocked() error {
 	r.head.Store(int64(head.idx))
 
 	// Wait for head future to finish or context cancellation
-	r.mu.Unlock()
 	select {
-	case <-r.ctx.Done():
-		r.mu.Lock()
-		return r.ctx.Err()
 	case <-head.done:
-		r.mu.Lock()
+	default:
+		r.waited = true
+		r.mu.Unlock()
+		select {
+		case <-r.ctx.Done():
+			r.mu.Lock()
+			return r.ctx.Err()
+		case <-head.done:
+			r.mu.Lock()
+		}
 	}
 
 	if head.err != nil {
@@ -271,12 +279,17 @@ func (r *Reader) advanceHeadChunkLocked() error {
 
 	// Slow-start: double the window every minWindow chunks consumed, so a short
 	// probe wastes at most a few chunks while a real download reaches full
-	// width after about 3-4 doublings instead of crawling there.
-	if r.chunksRead%r.minWindow == 0 && r.currentWindow < r.maxWindow {
-		r.currentWindow *= 2
-		if r.currentWindow > r.maxWindow {
-			r.currentWindow = r.maxWindow
+	// width after a few doublings instead of crawling there.
+	//
+	// It only grows while the reader has had to wait for a chunk: then
+	// Telegram is the slow side and a wider window lets more requests run.
+	// A client slower than Telegram never waits, so its window stays where it
+	// is and it doesn't sit on a full window of chunks it isn't reading.
+	if r.chunksRead%r.minWindow == 0 {
+		if r.waited && r.currentWindow < r.maxWindow {
+			r.currentWindow = min(r.currentWindow*2, r.maxWindow)
 		}
+		r.waited = false
 	}
 
 	// Top up window to fill new slots

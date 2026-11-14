@@ -402,7 +402,7 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 
 	// 9. Stream chunk data using the ordered sliding window reader
 	firstByte := time.Since(started)
-	cpuStart := processCPUTime()
+	cpuStart, hostStart, loadStart := processCPUTime(), readHostCPU(), s.scheduler.Load()
 	dw := &deadlineWriter{w: w, rc: http.NewResponseController(w), metrics: s.metrics}
 	_, err = reader.WriteTo(dw)
 
@@ -417,7 +417,7 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		outcome = "upstream_failed"
 	}
 	elapsed := time.Since(started)
-	fetchLimit, chunkAvg := s.scheduler.Load()
+	load := s.scheduler.Load()
 	var mbps float64
 	if sec := elapsed.Seconds(); sec > 0 {
 		mbps = float64(dw.sent) / (1024 * 1024) / sec
@@ -434,12 +434,18 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		zap.Duration("first_byte", firstByte.Round(time.Millisecond)),
 		zap.Duration("took", elapsed.Round(time.Millisecond)),
 		zap.String("avg_mb_per_s", fmt.Sprintf("%.1f", mbps)),
-		// What held the speed where it was: the whole process's CPU use while
-		// this download ran (100 = one core busy), how many getFile requests
-		// the scheduler allows in flight, and how long one chunk takes.
+		// What held the speed where it was. All of these cover the whole
+		// server while this download ran, not this download alone: mtflux's
+		// CPU use (100 = one core busy), how busy the machine was (100 = every
+		// core busy, kernel network work included), how many getFile requests
+		// the scheduler allows in flight, how long one chunk takes, and how
+		// many chunks were fetched a second time / how often that copy won.
 		zap.Int("cpu_pct", cpuPercent(processCPUTime()-cpuStart, elapsed-firstByte)),
-		zap.Int("fetch_limit", fetchLimit),
-		zap.Duration("chunk_avg", chunkAvg.Round(time.Millisecond)),
+		zap.Int("host_cpu_pct", hostBusyPercent(hostStart, readHostCPU())),
+		zap.Int("fetch_limit", load.Limit),
+		zap.Duration("chunk_avg", load.ChunkAvg.Round(time.Millisecond)),
+		zap.Int64("hedged", load.Hedges-loadStart.Hedges),
+		zap.Int64("hedge_wins", load.HedgeWins-loadStart.HedgeWins),
 	)
 
 	if err == nil {
